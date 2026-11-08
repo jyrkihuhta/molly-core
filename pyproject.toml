@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "molly-core"
+version = "0.1.0"
+description = "A Rust-enforced safety cage for autonomous agents that make outbound network requests."
+requires-python = ">=3.9"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+
+# The Python extension is OPTIONAL: molly-core is primarily a Rust crate. This
+# section only matters when you build the `molly_core._core` extension module
+# (`maturin develop` / `maturin build`), which turns on the `python` feature.
+[tool.maturin]
+features = ["python"]
+module-name = "molly_core._core"

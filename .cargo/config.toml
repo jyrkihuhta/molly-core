@@ -1,0 +1,11 @@
+# PyO3 extension modules use the `extension-module` feature, which deliberately
+# does NOT link libpython — those symbols are provided at runtime by the Python
+# interpreter that loads the .so. On macOS the linker must be told to allow the
+# undefined symbols. `maturin` injects this automatically; for a plain
+# `cargo build --features python` on macOS we set it here. It is a no-op for the
+# pure-Rust build (`cargo build`) and on non-macOS targets.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

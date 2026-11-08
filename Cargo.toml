@@ -1,0 +1,32 @@
+[package]
+name = "molly-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A Rust-enforced safety cage for autonomous agents that make outbound network requests: scope allowlist, explicit arming, fair rate limiting, and an append-only audit log, gating every request."
+repository = "https://github.com/jyrkihuhta/molly-core"
+readme = "README.md"
+keywords = ["security", "agent", "http", "sandbox", "audit"]
+categories = ["network-programming", "web-programming", "authentication"]
+
+[lib]
+name = "molly_core"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+url = "2"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Build the PyO3 bindings (the `molly_core._core` Python extension module).
+# Off by default so `cargo build` / `cargo add molly-core` give a pure-Rust crate.
+python = ["dep:pyo3"]
