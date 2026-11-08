@@ -161,6 +161,11 @@ a way to make a request that skips scope, arming, the rate limiter, or the audit
 log, that isn't an embarrassment to report — it's the whole reason the code is in
 the open. Open an issue, or better, a failing test.
 
+**New features are welcome, too.** Built something useful on top of the gate?
+Open a PR. Have an idea but not the time to build it? Open an issue and suggest
+it. For anything substantial, a quick issue to sketch the approach first saves us
+both rework.
+
 Ground rules, so the cage stays a cage:
 
 - New network capability goes **through the gated client**, never around it. A
