@@ -43,6 +43,31 @@ Rust layer: the agent (and any LLM driving it) can only reach the network throug
 request. Out-of-scope, unarmed, or over-rate requests return an error instead of a
 packet.
 
+## Use cases
+
+molly-core is useful anywhere code — especially code an LLM can steer — makes
+outbound requests you need to *bound and account for*:
+
+- **Caging an LLM agent's web access.** Give a tool-using or autonomous agent a
+  `fetch` it can call freely, knowing the model can only ever reach allowlisted
+  hosts, at a capped rate, with every call journaled. The model decides *what* to
+  request; the cage decides *whether it may*.
+- **An authorized-testing / pentest harness.** A scoped, armed, audited HTTP
+  client (plus `sweep`/`burst`/`raw_exchange`/`fetch_raw`) where every request is
+  provably in-scope, paced so you don't knock the target over, and backed by a
+  complete audit trail you can attach to the report.
+- **A hard "staging can't touch prod" lock.** The `scope_lock` pattern compiles an
+  allowlist into the binary: under `MOLLY_ENV=staging` the process *refuses to
+  start* if any configured target is outside it. Retargeting is a source change
+  and a rebuild — not a config edit someone can fat-finger at 3 a.m.
+- **Fair, rate-limited shared egress.** When several workers or agents share one
+  target's budget, the fair admission queue (priority, then FIFO) paces them so
+  none starves and none stampedes — respectful crawling and shared-quota API use
+  without a central coordinator.
+- **An append-only record of what left the box.** Even in a non-agent service, the
+  audit log gives you a per-request ledger — target, method, URL, body hash,
+  written *before* the request goes out — for forensics or regulated environments.
+
 ## Install (Rust)
 
 ```toml
@@ -125,6 +150,39 @@ resp = client.fetch("GET", "https://example.com/")
 
 - **Active** — full gates: scope + armed + rate + audit. For operations that act on the target.
 - **Passive** — scope + rate + audit, *armed skipped*. For read-only reconnaissance on a scoped-but-unarmed host.
+
+## Contributing
+
+Contributions, issues, and bug reports are all welcome — this is a young crate
+(0.1), and more eyes on the cage is exactly the point.
+
+The most valuable contribution is an **attempt to get around a gate.** If you find
+a way to make a request that skips scope, arming, the rate limiter, or the audit
+log, that isn't an embarrassment to report — it's the whole reason the code is in
+the open. Open an issue, or better, a failing test.
+
+Ground rules, so the cage stays a cage:
+
+- New network capability goes **through the gated client**, never around it. A
+  primitive that opens its own socket defeats the purpose.
+- Keep it **authorized-use-first.** This crate is for systems you own or are
+  cleared to test; a contribution shouldn't make the unsafe path the easy one.
+- Add or update tests, and keep the suite green.
+
+Getting set up:
+
+```sh
+git clone https://github.com/jyrkihuhta/molly-core
+cd molly-core
+cargo test                         # pure-Rust unit tests
+cargo run --example gated_client   # the offline gate tour
+cargo build --features python      # the optional PyO3 extension
+```
+
+PRs: fork, branch, make the tests pass, and run `cargo fmt` and `cargo clippy`
+before you push. For a security-sensitive gate bypass you'd rather not post in
+public, use this repo's private vulnerability reporting (GitHub → Security →
+Report a vulnerability), or reach me via [Medium](https://medium.com/@jyrkihuhta).
 
 ## License
 
