@@ -73,8 +73,15 @@ fn main() {
         client.pre_flight_check("https://example.com/", RequestMode::Passive),
     );
 
-    println!("\nEvery allowed check above also wrote an audit entry under:\n  {}",
-        std::env::temp_dir().join("molly-core-example-audit").display());
+    println!(
+        "\nThe checks above are pre-flight only — no request left the box, so\n\
+         nothing was written to the audit log. A real fetch/sweep/burst journals\n\
+         every request (before it leaves) under the configured audit directory,\n\
+         e.g.:\n  {}",
+        std::env::temp_dir()
+            .join("molly-core-example-audit")
+            .display()
+    );
 }
 
 fn report<T: std::fmt::Debug, E: std::fmt::Display>(label: &str, result: Result<T, E>) {

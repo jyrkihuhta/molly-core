@@ -34,7 +34,10 @@ pub struct ArmedEntry {
 
 impl ArmedEntry {
     fn unarmed() -> Self {
-        ArmedEntry { level: ArmedLevel::Unarmed, expires_at: None }
+        ArmedEntry {
+            level: ArmedLevel::Unarmed,
+            expires_at: None,
+        }
     }
 
     /// True once `expires_at` has passed. A malformed timestamp is treated
@@ -104,6 +107,9 @@ impl std::fmt::Display for ArmedLevel {
 }
 
 impl ArmedLevel {
+    // Inherent `from_str` is kept (fallible, domain-specific error) rather than
+    // the `FromStr` trait to avoid churning the public API.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, ArmedError> {
         match s.to_lowercase().as_str() {
             "unarmed" => Ok(ArmedLevel::Unarmed),
@@ -115,6 +121,7 @@ impl ArmedLevel {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ArmedError {
     /// Target is not armed — no outbound requests allowed.
     Unarmed(String),
@@ -141,6 +148,8 @@ impl std::fmt::Display for ArmedError {
         }
     }
 }
+
+impl std::error::Error for ArmedError {}
 
 /// Per-target armed state manager.
 #[derive(Debug)]
@@ -186,7 +195,13 @@ impl ArmedState {
     pub fn get_expiry(&self, target: &str) -> Result<Option<String>, ArmedError> {
         self.targets
             .get(target)
-            .map(|e| if e.is_expired() { None } else { e.expires_at.clone() })
+            .map(|e| {
+                if e.is_expired() {
+                    None
+                } else {
+                    e.expires_at.clone()
+                }
+            })
             .ok_or_else(|| ArmedError::UnknownTarget(target.to_string()))
     }
 
@@ -260,8 +275,8 @@ impl ArmedState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ArmedError::Io(e.to_string()))?;
         }
-        let data =
-            serde_json::to_string_pretty(&self.targets).map_err(|e| ArmedError::Io(e.to_string()))?;
+        let data = serde_json::to_string_pretty(&self.targets)
+            .map_err(|e| ArmedError::Io(e.to_string()))?;
         std::fs::write(path, data).map_err(|e| ArmedError::Io(e.to_string()))?;
         Ok(())
     }
@@ -316,7 +331,9 @@ mod tests {
     #[test]
     fn set_unknown_target_rejected() {
         let mut state = ArmedState::new(&targets());
-        let err = state.set("nonexistent", ArmedLevel::Armed, None).unwrap_err();
+        let err = state
+            .set("nonexistent", ArmedLevel::Armed, None)
+            .unwrap_err();
         assert!(matches!(err, ArmedError::UnknownTarget(_)));
     }
 
@@ -380,7 +397,10 @@ mod tests {
     #[test]
     fn armed_level_from_str() {
         assert_eq!(ArmedLevel::from_str("armed").unwrap(), ArmedLevel::Armed);
-        assert_eq!(ArmedLevel::from_str("UNARMED").unwrap(), ArmedLevel::Unarmed);
+        assert_eq!(
+            ArmedLevel::from_str("UNARMED").unwrap(),
+            ArmedLevel::Unarmed
+        );
         assert_eq!(ArmedLevel::from_str("Paused").unwrap(), ArmedLevel::Paused);
         assert!(ArmedLevel::from_str("invalid").is_err());
     }
@@ -456,7 +476,11 @@ mod tests {
         // "armed forever."
         let mut state = ArmedState::new(&targets());
         state
-            .set("linkedin", ArmedLevel::Armed, Some("not-a-timestamp".to_string()))
+            .set(
+                "linkedin",
+                ArmedLevel::Armed,
+                Some("not-a-timestamp".to_string()),
+            )
             .unwrap();
         assert_eq!(state.get("linkedin").unwrap(), ArmedLevel::Unarmed);
     }
@@ -473,7 +497,9 @@ mod tests {
     fn get_expiry_returns_the_stored_timestamp() {
         let mut state = ArmedState::new(&targets());
         let ts = future_ts(3600);
-        state.set("linkedin", ArmedLevel::Armed, Some(ts.clone())).unwrap();
+        state
+            .set("linkedin", ArmedLevel::Armed, Some(ts.clone()))
+            .unwrap();
         assert_eq!(state.get_expiry("linkedin").unwrap(), Some(ts));
     }
 
@@ -525,7 +551,9 @@ mod tests {
         let ts = future_ts(3600);
 
         let mut state = ArmedState::new(&targets());
-        state.set("linkedin", ArmedLevel::Armed, Some(ts.clone())).unwrap();
+        state
+            .set("linkedin", ArmedLevel::Armed, Some(ts.clone()))
+            .unwrap();
         state.save(&path).unwrap();
 
         let mut loaded = ArmedState::new(&targets());
@@ -562,7 +590,10 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(parsed["linkedin"].is_object(), "expected an object, got: {raw}");
+        assert!(
+            parsed["linkedin"].is_object(),
+            "expected an object, got: {raw}"
+        );
         assert_eq!(parsed["linkedin"]["level"], "armed");
         assert!(parsed["linkedin"]["expires_at"].is_null());
     }

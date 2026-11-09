@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RateLimitError {
     /// Bucket empty / deadline reached — retry after this duration.
     RetryAfter(Duration),
@@ -41,6 +42,8 @@ impl std::fmt::Display for RateLimitError {
         }
     }
 }
+
+impl std::error::Error for RateLimitError {}
 
 /// Smallest refill rate a bucket may run at (requests/second). A configured
 /// rate of zero or negative is clamped up to this so token-wait math stays
@@ -158,7 +161,11 @@ impl FairBucket {
     /// Takes `&Arc<Self>` so the RAII ticket can keep the bucket alive and remove
     /// this waiter from the queue on ANY exit (success, deadline, or panic) — a
     /// stale waiter would otherwise block everyone behind it.
-    pub fn acquire_blocking(self: &Arc<Self>, priority: i64, deadline: Instant) -> Result<(), Duration> {
+    pub fn acquire_blocking(
+        self: &Arc<Self>,
+        priority: i64,
+        deadline: Instant,
+    ) -> Result<(), Duration> {
         let key: WaiterKey = {
             let mut g = match self.inner.lock() {
                 Ok(g) => g,
@@ -172,7 +179,10 @@ impl FairBucket {
         };
         // Declared before `g` below so, on return, `g` (the lock) drops FIRST, then
         // this ticket re-locks to remove the waiter + wake the next front.
-        let _ticket = Ticket { bucket: Arc::clone(self), key };
+        let _ticket = Ticket {
+            bucket: Arc::clone(self),
+            key,
+        };
 
         let mut g = match self.inner.lock() {
             Ok(g) => g,
@@ -429,7 +439,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 // Stagger starts so arrival order is deterministic.
                 std::thread::sleep(Duration::from_millis(40 * id as u64));
-                b.acquire_blocking(0, Instant::now() + Duration::from_secs(30)).unwrap();
+                b.acquire_blocking(0, Instant::now() + Duration::from_secs(30))
+                    .unwrap();
                 tx.send(id).unwrap();
             }));
         }
@@ -458,14 +469,18 @@ mod tests {
         let b_low = Arc::clone(&b);
         let tx_low = tx.clone();
         let low = std::thread::spawn(move || {
-            b_low.acquire_blocking(0, Instant::now() + Duration::from_secs(30)).unwrap();
+            b_low
+                .acquire_blocking(0, Instant::now() + Duration::from_secs(30))
+                .unwrap();
             tx_low.send("low").unwrap();
         });
         std::thread::sleep(Duration::from_millis(50)); // low enqueues first
         let b_high = Arc::clone(&b);
         let tx_high = tx.clone();
         let high = std::thread::spawn(move || {
-            b_high.acquire_blocking(10, Instant::now() + Duration::from_secs(30)).unwrap();
+            b_high
+                .acquire_blocking(10, Instant::now() + Duration::from_secs(30))
+                .unwrap();
             tx_high.send("high").unwrap();
         });
         drop(tx);
@@ -473,7 +488,10 @@ mod tests {
         let first = rx.recv().unwrap();
         low.join().unwrap();
         high.join().unwrap();
-        assert_eq!(first, "high", "higher priority served before an earlier low one");
+        assert_eq!(
+            first, "high",
+            "higher priority served before an earlier low one"
+        );
     }
 
     #[test]

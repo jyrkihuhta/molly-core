@@ -2,6 +2,9 @@
 name = "molly-core"
 version = "0.1.0"
 edition = "2021"
+# MSRV is bounded by the dependency tree: `url` -> `idna` -> the ICU crates
+# currently require Rust 1.86. Raise this only in step with those deps.
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 description = "A Rust-enforced safety cage for autonomous agents that make outbound network requests: scope allowlist, explicit arming, fair rate limiting, and an append-only audit log, gating every request."
 repository = "https://github.com/jyrkihuhta/molly-core"
