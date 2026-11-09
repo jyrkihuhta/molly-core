@@ -235,7 +235,9 @@ impl HttpClient {
             .collect();
 
         let armed = Arc::new(RwLock::new(armed::ArmedState::new(&target_handles)));
-        let limiter = Arc::new(Mutex::new(crate::rate_limiter::RateLimiter::new(&rate_configs)));
+        let limiter = Arc::new(Mutex::new(crate::rate_limiter::RateLimiter::new(
+            &rate_configs,
+        )));
 
         let inner = fetch::HttpClient::new(
             targets,
@@ -376,9 +378,8 @@ impl HttpClient {
         let start = std::time::Instant::now();
 
         let inner = &self.inner;
-        let result = py.detach(|| {
-            inner.fetch_raw_path(method, url, raw_path, &headers, body, request_mode)
-        });
+        let result =
+            py.detach(|| inner.fetch_raw_path(method, url, raw_path, &headers, body, request_mode));
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -421,7 +422,12 @@ impl HttpClient {
         let inner = &self.inner;
         let result = py.detach(|| {
             inner.raw_exchange(
-                url, &payloads, read_timeout_secs, inter_write_delay_ms, max_bytes, request_mode,
+                url,
+                &payloads,
+                read_timeout_secs,
+                inter_write_delay_ms,
+                max_bytes,
+                request_mode,
             )
         });
         match result {
@@ -448,9 +454,8 @@ impl HttpClient {
     ) -> PyResult<(String, i32)> {
         let request_mode = parse_mode(mode)?;
         let inner = &self.inner;
-        let result = py.detach(|| {
-            inner.ssh_exec_gated(url, username, password, command, port, request_mode)
-        });
+        let result = py
+            .detach(|| inner.ssh_exec_gated(url, username, password, command, port, request_mode));
         match result {
             Ok(r) => Ok((r.stdout, r.exit_status)),
             Err(e) => Err(map_fetch_error(e)),
@@ -536,9 +541,8 @@ impl HttpClient {
     #[pyo3(signature = (url, mode=None))]
     fn pre_flight_check(&self, url: &str, mode: Option<&str>) -> PyResult<String> {
         let request_mode = match mode {
-            Some(m) => fetch::RequestMode::from_str(m).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(e.to_string())
-            })?,
+            Some(m) => fetch::RequestMode::from_str(m)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
             None => fetch::RequestMode::Active,
         };
         self.inner

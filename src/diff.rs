@@ -102,6 +102,7 @@ pub struct ResponseDiff {
 }
 
 /// Compare two HTTP responses and produce a structured diff.
+#[allow(clippy::too_many_arguments)] // a response is (status, headers, body, elapsed) x2
 pub fn diff_responses(
     baseline_status: u16,
     baseline_headers: &HashMap<String, String>,
@@ -205,9 +206,18 @@ fn diff_headers(
     changes
 }
 
+/// Bodies larger than this are NOT parsed as JSON for diffing — a sweep worker
+/// runs this on an attacker-controlled response body, and parsing a multi-MB
+/// document into an owned `serde_json::Value` tree is unbounded memory/CPU. The
+/// status/length/header diff still applies above the threshold.
+const MAX_JSON_DIFF_BYTES: usize = 512 * 1024;
+
 /// Try to parse both bodies as JSON and compute a structural diff.
-/// Returns None if either body is not valid JSON.
+/// Returns None if either body is not valid JSON or is too large to diff.
 fn diff_json_bodies(baseline_body: &str, mutation_body: &str) -> Option<JsonDiff> {
+    if baseline_body.len() > MAX_JSON_DIFF_BYTES || mutation_body.len() > MAX_JSON_DIFF_BYTES {
+        return None;
+    }
     let base_val: serde_json::Value = serde_json::from_str(baseline_body).ok()?;
     let mut_val: serde_json::Value = serde_json::from_str(mutation_body).ok()?;
 
@@ -303,7 +313,11 @@ fn value_summary(val: &serde_json::Value) -> String {
     match val {
         serde_json::Value::String(s) => {
             if s.len() > 50 {
-                format!("\"{}...\"", &s[..47])
+                // Truncate to 47 *characters*, not bytes. A raw byte slice
+                // `&s[..47]` panics when a multi-byte UTF-8 character straddles
+                // byte 47; taking whole chars can never split a codepoint.
+                let truncated: String = s.chars().take(47).collect();
+                format!("\"{truncated}...\"")
             } else {
                 format!("\"{s}\"")
             }
@@ -317,6 +331,7 @@ fn value_summary(val: &serde_json::Value) -> String {
 }
 
 /// Determine a verdict string based on the diff.
+#[allow(clippy::too_many_arguments)] // signal inputs are intentionally explicit
 fn compute_verdict(
     status_match: bool,
     _baseline_status: u16,
@@ -346,14 +361,17 @@ fn compute_verdict(
     if let Some(diff) = json_diff {
         if !diff.is_empty() {
             let count = diff.change_count();
-            return format!("SIGNIFICANT CHANGE ({count} diff{})", if count == 1 { "" } else { "s" });
+            return format!(
+                "SIGNIFICANT CHANGE ({count} diff{})",
+                if count == 1 { "" } else { "s" }
+            );
         }
     }
 
     // Body length changed significantly (>20%)
     if body_len_baseline > 0 {
-        let ratio = (body_len_mutation as f64 - body_len_baseline as f64).abs()
-            / body_len_baseline as f64;
+        let ratio =
+            (body_len_mutation as f64 - body_len_baseline as f64).abs() / body_len_baseline as f64;
         if ratio > 0.2 {
             return "BODY SIZE CHANGE".to_string();
         }
@@ -424,14 +442,7 @@ mod tests {
 
     #[test]
     fn status_change() {
-        let diff = diff0(
-            200,
-            &headers(&[]),
-            "ok",
-            404,
-            &headers(&[]),
-            "not found",
-        );
+        let diff = diff0(200, &headers(&[]), "ok", 404, &headers(&[]), "not found");
         assert!(!diff.status_match);
         assert_eq!(diff.status_baseline, 200);
         assert_eq!(diff.status_mutation, 404);
@@ -515,14 +526,8 @@ mod tests {
         );
         assert_eq!(diff.header_changes.len(), 1);
         assert_eq!(diff.header_changes[0].key, "server");
-        assert_eq!(
-            diff.header_changes[0].baseline.as_deref(),
-            Some("nginx")
-        );
-        assert_eq!(
-            diff.header_changes[0].mutation.as_deref(),
-            Some("apache")
-        );
+        assert_eq!(diff.header_changes[0].baseline.as_deref(), Some("nginx"));
+        assert_eq!(diff.header_changes[0].mutation.as_deref(), Some("apache"));
     }
 
     #[test]
@@ -569,7 +574,14 @@ mod tests {
 
     #[test]
     fn non_json_same_size() {
-        let diff = diff0(200, &headers(&[]), "hello world", 200, &headers(&[]), "hello there");
+        let diff = diff0(
+            200,
+            &headers(&[]),
+            "hello world",
+            200,
+            &headers(&[]),
+            "hello there",
+        );
         assert!(diff.json_diff.is_none());
         assert_eq!(diff.verdict, "NO CHANGE"); // Same size, not JSON
     }
@@ -620,11 +632,52 @@ mod tests {
     }
 
     #[test]
+    fn value_summary_does_not_panic_on_multibyte_boundary() {
+        // Regression: a multi-byte char straddling byte 47 used to panic the
+        // raw slice `&s[..47]`. 46 ASCII bytes + 'é' (2 bytes) puts a codepoint
+        // boundary across byte 47; the summary must truncate safely instead.
+        let s = format!("{}é{}", "a".repeat(46), "b".repeat(60));
+        assert!(s.len() > 50);
+        let summary = value_summary(&serde_json::Value::String(s));
+        assert!(summary.ends_with("...\""));
+        // Bounded: two quotes + up to 47 chars + "..." = at most 52 chars.
+        assert!(
+            summary.chars().count() <= 47 + 5,
+            "len was {}",
+            summary.chars().count()
+        );
+    }
+
+    #[test]
+    fn diff_bodies_with_multibyte_values_do_not_panic() {
+        // End-to-end through diff_responses: a changed JSON string value with a
+        // multi-byte char near the truncation boundary must diff, not panic.
+        let base = format!(r#"{{"k":"{}"}}"#, "a".repeat(80));
+        let mutant = format!(r#"{{"k":"{}é{}"}}"#, "a".repeat(46), "b".repeat(40));
+        let diff = diff0(200, &headers(&[]), &base, 200, &headers(&[]), &mutant);
+        let jd = diff.json_diff.as_ref().unwrap();
+        assert_eq!(jd.values_changed.len(), 1);
+    }
+
+    #[test]
     fn empty_bodies() {
         let diff = diff0(200, &headers(&[]), "", 200, &headers(&[]), "");
         assert!(diff.json_diff.is_none());
         assert_eq!(diff.body_len_delta, 0);
         assert_eq!(diff.verdict, "NO CHANGE");
+    }
+
+    #[test]
+    fn oversized_json_bodies_are_not_diffed() {
+        // Above the JSON-diff size cap, parsing is skipped (no unbounded
+        // alloc), but the overall diff still works via status/length.
+        let big = format!(r#"{{"k":"{}"}}"#, "a".repeat(600_000));
+        let diff = diff0(200, &headers(&[]), &big, 200, &headers(&[]), &big);
+        assert!(
+            diff.json_diff.is_none(),
+            "oversized bodies must not be JSON-diffed"
+        );
+        assert_eq!(diff.verdict, "NO CHANGE"); // same body, same size
     }
 
     // --- Timing anomaly (molly#23) ---
@@ -669,16 +722,7 @@ mod tests {
     fn minor_jitter_is_not_a_timing_anomaly() {
         // Same order of magnitude, well under both the 2x multiplier and the
         // 500ms floor — ordinary network jitter, not a signal.
-        let diff = diff_responses(
-            200,
-            &headers(&[]),
-            "ok",
-            200,
-            200,
-            &headers(&[]),
-            "ok",
-            260,
-        );
+        let diff = diff_responses(200, &headers(&[]), "ok", 200, 200, &headers(&[]), "ok", 260);
         assert!(!diff.timing_anomaly);
         assert_eq!(diff.verdict, "NO CHANGE");
     }

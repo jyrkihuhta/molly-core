@@ -14,9 +14,39 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+/// A header key is invalid if empty or carrying a byte that could break HTTP/1.1
+/// framing — a colon, whitespace, or any control byte (CR/LF included).
+fn is_invalid_header_key(k: &str) -> bool {
+    k.is_empty()
+        || k.bytes()
+            .any(|b| b == b':' || b == b' ' || b == b'\t' || b.is_ascii_control())
+}
+
+/// A header value is invalid if it contains CR, LF, NUL, or any control byte
+/// other than horizontal tab — these enable request-splitting / header
+/// injection when written verbatim into the raw request.
+fn is_invalid_header_value(v: &str) -> bool {
+    v.bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == b'\0' || (b.is_ascii_control() && b != b'\t'))
+}
+
+/// Resolve `host:port` and connect with a bounded connect timeout, so a dead or
+/// filtered host can't hang the calling thread until the OS default fires.
+fn connect_timed(host: &str, port: u16, timeout_secs: u64) -> Result<TcpStream, String> {
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("raw resolve {host}:{port} failed: {e}"))?
+        .next()
+        .ok_or_else(|| format!("raw resolve {host}:{port}: no addresses"))?;
+    TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("raw connect {host}:{port} failed: {e}"))
+}
+
+#[derive(Debug, Clone)]
 pub struct RawResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
@@ -35,8 +65,23 @@ pub fn send_raw(
     body: Option<&str>,
     timeout_secs: u64,
 ) -> Result<RawResponse, String> {
-    let mut stream = TcpStream::connect((host, port))
-        .map_err(|e| format!("raw connect {host}:{port} failed: {e}"))?;
+    // Validate caller headers BEFORE opening a socket: a CR/LF (or other
+    // control byte) in a header key/value would split the request line and
+    // smuggle a second request past the scope check. Fail fast, fail closed.
+    for (k, v) in headers {
+        let lk = k.to_ascii_lowercase();
+        if lk == "host" || lk == "connection" || lk == "content-length" {
+            continue;
+        }
+        if is_invalid_header_key(k) || is_invalid_header_value(v) {
+            return Err(format!(
+                "raw send: header {k:?}={v:?} contains control characters — refusing \
+                 (HTTP request-splitting guard)"
+            ));
+        }
+    }
+
+    let mut stream = connect_timed(host, port, timeout_secs)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
         .ok();
@@ -114,8 +159,7 @@ pub fn raw_exchange(
     inter_write_delay_ms: u64,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect((host, port))
-        .map_err(|e| format!("raw_exchange connect {host}:{port} failed: {e}"))?;
+    let mut stream = connect_timed(host, port, read_timeout_secs)?;
     let t = Duration::from_secs(read_timeout_secs.max(1));
     stream.set_read_timeout(Some(t)).ok();
     stream.set_write_timeout(Some(t)).ok();
@@ -208,15 +252,53 @@ mod tests {
 
         // The CVE-2021-41773 shape: encoded dots that ureq would collapse.
         let path = "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh";
-        let resp = send_raw("127.0.0.1", port, "POST", path, &HashMap::new(), Some("x"), 5).unwrap();
+        let resp = send_raw(
+            "127.0.0.1",
+            port,
+            "POST",
+            path,
+            &HashMap::new(),
+            Some("x"),
+            5,
+        )
+        .unwrap();
         server.join().unwrap();
 
         let sent = rx.recv().unwrap();
         let req_line = sent.lines().next().unwrap();
-        assert_eq!(req_line, format!("POST {path} HTTP/1.1"), "path was altered: {req_line}");
+        assert_eq!(
+            req_line,
+            format!("POST {path} HTTP/1.1"),
+            "path was altered: {req_line}"
+        );
         assert!(sent.contains("Content-Length: 1"));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, "flag");
+    }
+
+    #[test]
+    fn send_raw_rejects_crlf_header_injection() {
+        // A CR/LF in a header value must be refused before any socket opens —
+        // otherwise it would split the request and smuggle a second one past
+        // the scope check.
+        let mut h = HashMap::new();
+        h.insert(
+            "X-Evil".to_string(),
+            "a\r\nGET /admin HTTP/1.1\r\nHost: x".to_string(),
+        );
+        let err = send_raw("127.0.0.1", 1, "GET", "/", &h, None, 1).unwrap_err();
+        assert!(
+            err.contains("request-splitting") || err.contains("control characters"),
+            "expected an injection refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn send_raw_rejects_header_key_with_newline() {
+        let mut h = HashMap::new();
+        h.insert("X-Bad\r\nInjected".to_string(), "v".to_string());
+        let err = send_raw("127.0.0.1", 1, "GET", "/", &h, None, 1).unwrap_err();
+        assert!(err.contains("control characters") || err.contains("request-splitting"));
     }
 
     #[test]
@@ -247,7 +329,15 @@ mod tests {
         });
 
         let payload = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec();
-        let out = raw_exchange("127.0.0.1", port, &[payload.clone()], 5, 0, 1_000_000).unwrap();
+        let out = raw_exchange(
+            "127.0.0.1",
+            port,
+            std::slice::from_ref(&payload),
+            5,
+            0,
+            1_000_000,
+        )
+        .unwrap();
         server.join().unwrap();
 
         let sent = rx.recv().unwrap();
@@ -264,7 +354,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .ok();
             let mut chunk = [0u8; 4096];
             // Respond once per request line seen (read a couple of times).
             for _ in 0..2 {
@@ -285,6 +377,10 @@ mod tests {
         server.join().unwrap();
 
         let body = String::from_utf8_lossy(&out);
-        assert_eq!(body.matches("HTTP/1.1 200 OK").count(), 2, "expected two responses: {body:?}");
+        assert_eq!(
+            body.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "expected two responses: {body:?}"
+        );
     }
 }

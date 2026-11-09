@@ -2,7 +2,7 @@
 //!
 //! This is the actual enforcement of the operator's hard safety invariant
 //! #1 — "Staging Molly may only fire at TEST targets... Enforcement belongs
-//! at Molly's Rust scope layer, not convention." 
+//! at Molly's Rust scope layer, not convention."
 //!
 //! When the `MOLLY_ENV=staging` environment variable is set, every
 //! configured scope rule's host must be one of the hardcoded target-dummy
@@ -37,6 +37,15 @@ const TEST_DUMMY_HOSTS: &[&str] = &[
 
 const LOCK_ENV_VAR: &str = "MOLLY_ENV";
 const LOCK_ENV_VALUE: &str = "staging";
+
+/// Process-global lock serializing every test that reads or mutates `MOLLY_ENV`.
+/// Because `HttpClient::new` now reads it (the scope lock runs in the primary
+/// constructor), any test that constructs a client must hold this while a
+/// scope-lock test might have `MOLLY_ENV=staging` set — otherwise the client's
+/// lock check could see a transient `staging` and spuriously reject. Test-only;
+/// production never coordinates on it.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// XBOW validation-benchmark challenges, deployed as `xben-NNN-...`
 /// containers on `target-dummy_range` — deliberately-vulnerable TEST
@@ -100,8 +109,7 @@ mod tests {
     // first panicking one would silently inherit a mutated MOLLY_ENV. An RAII
     // guard makes that unconditional via Drop; a plain "restore after f()"
     // helper does not — this file's history has already hit that exact bug.
-    use std::sync::{Mutex, MutexGuard};
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     struct LockEnvGuard<'a> {
         _mutex_guard: MutexGuard<'a, ()>,
@@ -156,10 +164,7 @@ mod tests {
     #[test]
     fn locked_allows_dvga() {
         let _guard = with_lock_env(Some("staging"));
-        let targets = vec![(
-            "dvga".to_string(),
-            vec!["http://dvga:5013/*".to_string()],
-        )];
+        let targets = vec![("dvga".to_string(), vec!["http://dvga:5013/*".to_string()])];
         assert!(enforce(&targets).is_ok());
     }
 

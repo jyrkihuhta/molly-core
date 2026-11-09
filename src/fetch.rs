@@ -1,8 +1,9 @@
-//! HTTP client with safety gates — the core of Molly's outbound request pipeline.
+//! HTTP client with safety gates — the single egress through which every
+//! outbound request passes.
 //!
 //! Every outbound request passes through:
 //! 1. Target resolution (which scope checker matches this URL?)
-//! 2. Armed state check — **skipped in Passive mode** (enumeration/recon)
+//! 2. Armed state check — **skipped for Passive read-only recon**
 //! 3. Rate limit check (does the target have tokens?)
 //! 4. Audit log (pre-request)
 //! 5. HTTP request via ureq
@@ -12,11 +13,10 @@
 //!
 //! ## Request modes
 //!
-//! - `Active` (default): full safety gates including armed check. Used by the
-//!   testing pipeline (smart_repeater, offensive tools).
-//! - `Passive`: scope + rate limit + audit, but **no armed check**. Used by
-//!   enumeration tools (crt, dns, fingerprint, headers, exposed files) that
-//!   perform passive reconnaissance without offensive payloads.
+//! - `Active` (default): full safety gates including the armed check.
+//! - `Passive`: scope + rate limit + audit, with the armed check skipped — but
+//!   only for read-only recon (GET/HEAD/OPTIONS). Mutating methods and the
+//!   raw/SSH primitives always enforce the armed gate, even in Passive mode.
 
 #![allow(dead_code)] // Public API surface — some methods used only from Python via lib.rs
 
@@ -64,15 +64,66 @@ fn collect_headers(resp: &ureq::Response) -> HashMap<String, String> {
 /// Controls which safety gates a request passes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestMode {
-    /// Full safety gates: scope + armed + rate limit + audit.
-    /// Used by the testing pipeline for offensive operations.
+    /// Full gates: scope + armed + rate limit + audit. Required for any request
+    /// that acts on the target (all mutating methods and the raw/SSH primitives
+    /// run as if `Active` regardless of this flag).
     Active,
-    /// Reduced gates: scope + rate limit + audit (no armed check).
-    /// Used by enumeration tools for passive reconnaissance.
+    /// Read-only recon: scope + rate limit + audit, with the armed gate skipped
+    /// — but only for GET/HEAD/OPTIONS. Lets enumeration run on a scoped-but-
+    /// unarmed host; it can never fire an action-bearing request at one.
     Passive,
 }
 
+/// Whether an HTTP method is read-only recon (safe to run in Passive mode on a
+/// scoped-but-unarmed host). Anything else mutates the target and must pass the
+/// armed gate even in Passive mode.
+fn method_is_read_only(method: &str) -> bool {
+    matches!(method.to_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")
+}
+
+/// Extract every HTTP/1.x request-line target from a verbatim payload that may
+/// carry several pipelined requests, working on the RAW bytes so the authorized
+/// path is byte-identical to what goes on the wire.
+///
+/// A request line is recognized by its trailing `HTTP/x.y` version token,
+/// regardless of method case — so a lowercase/odd-case decoy method cannot slip
+/// an unauthorized request past the check. Used only to authorize raw-exchange
+/// paths against a path-restricted scope, where it is deliberately fail-closed:
+/// returns `None` when a line looks like a request line but its target cannot be
+/// cleanly extracted (malformed, or a non-UTF-8 target that can't be
+/// prefix-matched), so the caller refuses the whole exchange. `Some(targets)`
+/// lists every target found (possibly empty, which the caller also treats as
+/// "cannot verify → refuse" under a path-restricted scope).
+fn request_line_targets(payload: &[u8]) -> Option<Vec<String>> {
+    let mut targets = Vec::new();
+    for line in payload.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let toks: Vec<&[u8]> = line
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|t| !t.is_empty())
+            .collect();
+        let Some(last) = toks.last() else { continue };
+        if !last.starts_with(b"HTTP/") {
+            continue; // not a request line (header, body, blank)
+        }
+        // Request-ish (ends in an HTTP version token). A well-formed request
+        // line is `METHOD target HTTP/x.y`; anything we can't split into at
+        // least those three parts, or whose target isn't valid UTF-8, is a
+        // refusal rather than a silent skip.
+        if toks.len() < 3 {
+            return None;
+        }
+        match std::str::from_utf8(toks[1]) {
+            Ok(t) if !t.is_empty() => targets.push(t.to_string()),
+            _ => return None,
+        }
+    }
+    Some(targets)
+}
+
 impl RequestMode {
+    // Inherent `from_str` kept over the `FromStr` trait to avoid an API change.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, FetchError> {
         match s.to_lowercase().as_str() {
             "active" => Ok(RequestMode::Active),
@@ -84,7 +135,7 @@ impl RequestMode {
     }
 }
 
-/// HTTP response returned to Python.
+/// A completed HTTP response: status, headers, body, and how long the call took.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -95,6 +146,7 @@ pub struct HttpResponse {
 
 /// Errors from the fetch pipeline.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FetchError {
     /// URL is not in any target's scope.
     NoMatchingTarget(String),
@@ -105,10 +157,7 @@ pub enum FetchError {
     /// Target is paused.
     Paused(String),
     /// Rate limit exceeded — includes retry duration in ms.
-    RateLimited {
-        target: String,
-        retry_after_ms: u64,
-    },
+    RateLimited { target: String, retry_after_ms: u64 },
     /// HTTP request failed.
     HttpError(String),
     /// Invalid HTTP method.
@@ -147,6 +196,8 @@ impl std::fmt::Display for FetchError {
         }
     }
 }
+
+impl std::error::Error for FetchError {}
 
 /// Target configuration for the HTTP client.
 pub struct TargetConfig {
@@ -232,6 +283,33 @@ fn env_duration_secs(env_var: &str, default_secs: u64, floor_secs: u64) -> std::
     std::time::Duration::from_secs(secs)
 }
 
+/// Read a positive `usize` from `env_var`, falling back to `default`. A missing,
+/// empty, non-numeric, or zero value yields the default.
+fn env_usize(env_var: &str, default: usize) -> usize {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, snapping *down* to the nearest
+/// UTF-8 character boundary so a multi-byte character is never split.
+///
+/// A raw byte slice `&s[..max_bytes]` panics when `max_bytes` lands inside a
+/// multi-byte codepoint (a malicious server can arrange exactly that at the
+/// body-size cap); this never panics and always yields valid UTF-8.
+fn truncate_on_char_boundary(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 impl HttpClient {
     /// Create a new HTTP client.
     ///
@@ -242,6 +320,17 @@ impl HttpClient {
         limiter: Arc<Mutex<RateLimiter>>,
         audit_dir: std::path::PathBuf,
     ) -> Result<Self, FetchError> {
+        // MOLLY_ENV=staging hard scope lock — enforced here, in the primary
+        // (pure-Rust) constructor, before anything else is built, so a locked
+        // instance configured with even one out-of-allowlist rule refuses to
+        // start. This path is the one every consumer goes through (the PyO3
+        // constructor also calls it), so the lock can never be absent.
+        let lock_targets: Vec<(String, Vec<String>)> = target_configs
+            .iter()
+            .map(|(handle, rules, _)| (handle.clone(), rules.clone()))
+            .collect();
+        crate::scope_lock::enforce(&lock_targets).map_err(FetchError::ScopeViolation)?;
+
         let targets: Vec<TargetConfig> = target_configs
             .iter()
             .map(|(handle, rules, _rps)| TargetConfig {
@@ -250,8 +339,7 @@ impl HttpClient {
             })
             .collect();
 
-        let audit =
-            AuditLog::new(audit_dir).map_err(|e| FetchError::HttpError(e.to_string()))?;
+        let audit = AuditLog::new(audit_dir).map_err(|e| FetchError::HttpError(e.to_string()))?;
 
         // Per-request timeouts. The read timeout caps how long a *hanging*
         // endpoint costs us: at the old 60s, one dead endpoint burned a full
@@ -290,27 +378,40 @@ impl HttpClient {
         url: &str,
         mode: RequestMode,
     ) -> Result<PreFlightResult, FetchError> {
-        self.pre_flight_check_inner(url, mode, true)
+        self.pre_flight_check_inner(url, mode, true, false)
     }
 
-    /// Pre-flight with an explicit rate-limit toggle. `enforce_rate = false`
-    /// runs scope (+ armed in Active mode) but consumes no token — used by
-    /// `burst`, which deliberately bypasses the per-target limiter for the
-    /// race window.
+    /// Pre-flight with explicit rate-limit and armed toggles.
+    ///
+    /// `enforce_rate = false` runs scope (+ armed per the rules below) but
+    /// consumes no token — used by `burst`, which deliberately bypasses the
+    /// per-target limiter for the race window.
+    ///
+    /// `require_armed = true` forces the armed authorization check even in
+    /// `Passive` mode. Passive mode exists to let *read-only* recon run on a
+    /// scoped-but-unarmed host; it must NOT be a way to fire action-bearing
+    /// primitives (SSH exec, raw/verbatim socket writes, request smuggling, or
+    /// mutating HTTP methods) at a target the operator never armed. Those
+    /// callers pass `require_armed = true` so the armed gate is enforced
+    /// regardless of the caller-supplied `mode`.
     fn pre_flight_check_inner(
         &self,
         url: &str,
         mode: RequestMode,
         enforce_rate: bool,
+        require_armed: bool,
     ) -> Result<PreFlightResult, FetchError> {
         // 1. Resolve which target's scope matches this URL
         let target_handle = self.resolve_target(url)?;
 
-        // 2. Check armed state (Active mode only)
-        if mode == RequestMode::Active {
-            let armed = self.armed.read().map_err(|e| {
-                FetchError::HttpError(format!("Armed state lock poisoned: {e}"))
-            })?;
+        // 2. Check armed state. Skipped only for Passive *read-only* recon —
+        //    any action-bearing caller sets require_armed so an unarmed target
+        //    is refused even in Passive mode.
+        if mode == RequestMode::Active || require_armed {
+            // Recover a poisoned lock rather than failing the gate forever: a
+            // panic in some unrelated request must not permanently brick the
+            // client. The armed state is plain data, consistent after a panic.
+            let armed = self.armed.read().unwrap_or_else(|e| e.into_inner());
             armed.check(&target_handle).map_err(|e| match e {
                 ArmedError::Unarmed(t) => FetchError::NotArmed(t),
                 ArmedError::Paused(t) => FetchError::Paused(t),
@@ -322,9 +423,7 @@ impl HttpClient {
 
         // 3. Check rate limit (unless the caller opts out, e.g. burst)
         if enforce_rate {
-            let mut limiter = self.limiter.lock().map_err(|e| {
-                FetchError::HttpError(format!("Rate limiter lock poisoned: {e}"))
-            })?;
+            let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
             limiter.try_acquire(&target_handle).map_err(|e| match e {
                 RateLimitError::RetryAfter(d) => FetchError::RateLimited {
                     target: target_handle.clone(),
@@ -334,9 +433,7 @@ impl HttpClient {
             })?;
         }
 
-        Ok(PreFlightResult {
-            target_handle,
-        })
+        Ok(PreFlightResult { target_handle })
     }
 
     /// Make an HTTP request through all safety gates.
@@ -391,8 +488,9 @@ impl HttpClient {
         mode: RequestMode,
         priority: i64,
     ) -> Result<HttpResponse, FetchError> {
-        // Fail fast on scope/armed before we ever queue or consume a token.
-        self.pre_flight_check_inner(url, mode, false)?;
+        // Fail fast on scope/armed before we ever queue or consume a token. A
+        // mutating method must pass the armed gate even in Passive mode.
+        self.pre_flight_check_inner(url, mode, false, !method_is_read_only(method))?;
         // Fair, blocking rate admission (consumes the token honoring priority+FIFO).
         self.fair_admit(url, priority)?;
         // Audit + execute; enforce_rate=false — fair_admit already took the token.
@@ -410,14 +508,16 @@ impl HttpClient {
     fn fair_admit(&self, url: &str, priority: i64) -> Result<(), FetchError> {
         let target = self.resolve_target(url)?;
         let bucket = {
-            let limiter = self.limiter.lock().map_err(|e| {
-                FetchError::HttpError(format!("Rate limiter lock poisoned: {e}"))
-            })?;
+            let limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
             limiter.bucket_for(&target)
         };
         let bucket = bucket.ok_or_else(|| FetchError::NoMatchingTarget(target.clone()))?;
         let max_wait = env_duration_secs("MOLLY_FAIR_ADMISSION_MAX_WAIT_SECS", 60, 1);
-        let deadline = Instant::now() + max_wait;
+        // Guard against Instant + Duration overflow on an absurdly large env
+        // value: fall back to a sane cap rather than panicking.
+        let deadline = Instant::now()
+            .checked_add(max_wait)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
         bucket
             .acquire_blocking(priority, deadline)
             .map_err(|remaining| FetchError::RateLimited {
@@ -447,6 +547,7 @@ impl HttpClient {
     /// pre-flight gates → fail-closed pre-audit → execute → post-audit.
     /// `body_audit` is the string form recorded in the audit log (the text body
     /// itself, or a synthesized note for a binary one).
+    #[allow(clippy::too_many_arguments)] // shared request path; each arg is distinct
     fn fetch_core(
         &self,
         method: &str,
@@ -457,10 +558,13 @@ impl HttpClient {
         mode: RequestMode,
         enforce_rate: bool,
     ) -> Result<HttpResponse, FetchError> {
-        // Pre-flight checks (scope, armed if active, rate limit). `enforce_rate`
-        // is false only when the caller already consumed a token via the fair
-        // admission queue (see `fetch_fair`) — never skip scope/armed.
-        let pre_flight = self.pre_flight_check_inner(url, mode, enforce_rate)?;
+        // Pre-flight checks (scope, armed, rate limit). `enforce_rate` is false
+        // only when the caller already consumed a token via the fair admission
+        // queue (see `fetch_fair`) — never skip scope/armed. A mutating method
+        // (POST/PUT/DELETE/PATCH/…) must pass the armed gate even in Passive
+        // mode; only GET/HEAD/OPTIONS recon is armed-exempt there.
+        let require_armed = !method_is_read_only(method);
+        let pre_flight = self.pre_flight_check_inner(url, mode, enforce_rate, require_armed)?;
         let target = &pre_flight.target_handle;
 
         // Audit log: pre-request. For Active requests this is fail-closed —
@@ -528,9 +632,17 @@ impl HttpClient {
         body: Option<&str>,
         mode: RequestMode,
     ) -> Result<HttpResponse, FetchError> {
-        // Same gates as fetch: scope + armed (active) + rate limit.
-        let pre_flight = self.pre_flight_check(url, mode)?;
+        // Same gates as fetch: scope + armed + rate limit. A verbatim raw-path
+        // request is action-bearing, so the armed gate is enforced even in
+        // Passive mode (require_armed = true).
+        let pre_flight = self.pre_flight_check_inner(url, mode, true, true)?;
         let target = &pre_flight.target_handle;
+
+        // Scope authorized `url`, but the request line we actually send uses the
+        // caller-controlled `raw_path`. Authorize the path that goes out, so a
+        // path-restricted scope (e.g. `host/api/*`) can't be satisfied with an
+        // in-prefix `url` while the raw path escapes the prefix.
+        self.authorize_raw_path(target, url, raw_path)?;
 
         let parsed = url::Url::parse(url)
             .map_err(|e| FetchError::HttpError(format!("fetch_raw: bad url {url}: {e}")))?;
@@ -568,13 +680,23 @@ impl HttpClient {
         match &result {
             Ok(resp) => {
                 let e = AuditLog::post_request_entry(
-                    target, method, &audit_url, body, resp.status, elapsed_ms,
+                    target,
+                    method,
+                    &audit_url,
+                    body,
+                    resp.status,
+                    elapsed_ms,
                 );
                 let _ = self.audit.log(&e);
             }
             Err(e) => {
                 let e2 = AuditLog::error_entry(
-                    target, method, &audit_url, body, &e.to_string(), Some(elapsed_ms),
+                    target,
+                    method,
+                    &audit_url,
+                    body,
+                    &e.to_string(),
+                    Some(elapsed_ms),
                 );
                 let _ = self.audit.log(&e2);
             }
@@ -601,11 +723,48 @@ impl HttpClient {
         mode: RequestMode,
     ) -> Result<Vec<u8>, FetchError> {
         if payloads.is_empty() {
-            return Err(FetchError::HttpError("raw_exchange: no payloads".to_string()));
+            return Err(FetchError::HttpError(
+                "raw_exchange: no payloads".to_string(),
+            ));
         }
         // 1. Scope + armed (no token yet) — fail fast before any connection.
-        let pre_flight = self.pre_flight_check_inner(url, mode, false)?;
+        //    Verbatim socket writes are action-bearing, so the armed gate is
+        //    enforced even in Passive mode (require_armed = true).
+        let pre_flight = self.pre_flight_check_inner(url, mode, false, true)?;
         let target = pre_flight.target_handle;
+
+        // 1b. If the authorizing scope restricts paths (more specific than a
+        //     host-only `/*`), the verbatim payloads must not reach a path
+        //     outside it. Scope-check every request line found in the payloads;
+        //     a payload whose request line we cannot read is refused (fail
+        //     closed). Host-only scopes impose no path restriction and skip this.
+        if self.scope_is_path_restricted(&target, url) {
+            for payload in payloads {
+                match request_line_targets(payload) {
+                    // A request-ish line we couldn't parse to a target, or a
+                    // payload with no parseable request line at all: under a
+                    // path-restricted scope we cannot prove where it goes, so
+                    // refuse the whole exchange (fail closed).
+                    None => {
+                        return Err(FetchError::ScopeViolation(format!(
+                            "raw_exchange: scope for {url} is path-restricted, but a payload's \
+                             request line could not be parsed to authorize its path"
+                        )));
+                    }
+                    Some(targets) if targets.is_empty() => {
+                        return Err(FetchError::ScopeViolation(format!(
+                            "raw_exchange: scope for {url} is path-restricted, but a payload \
+                             contained no parseable request line to authorize"
+                        )));
+                    }
+                    Some(targets) => {
+                        for req_target in &targets {
+                            self.authorize_raw_path(&target, url, req_target)?;
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Resolve host:port from the (scoped) url. HTTP only — no TLS on the raw path.
         let parsed = url::Url::parse(url)
@@ -630,7 +789,11 @@ impl HttpClient {
         // 4. Fail-closed pre-audit (log BEFORE the bytes leave). One entry; the raw bytes
         //    are summarized as a note (hashed), matching fetch_bytes' binary-body note.
         let total: usize = payloads.iter().map(|p| p.len()).sum();
-        let note = format!("[raw_exchange: {} payload(s), {} bytes]", payloads.len(), total);
+        let note = format!(
+            "[raw_exchange: {} payload(s), {} bytes]",
+            payloads.len(),
+            total
+        );
         let audit_url = format!("http://{host}:{port}/");
         let pre_entry = AuditLog::pre_request_entry(&target, "RAW", &audit_url, Some(&note));
         if let Err(e) = self.audit.log(&pre_entry) {
@@ -642,7 +805,12 @@ impl HttpClient {
         // 5. Execute the raw exchange.
         let start = Instant::now();
         let result = crate::raw_request::raw_exchange(
-            &host, port, payloads, read_timeout_secs, inter_write_delay_ms, max_bytes,
+            &host,
+            port,
+            payloads,
+            read_timeout_secs,
+            inter_write_delay_ms,
+            max_bytes,
         )
         .map_err(FetchError::HttpError);
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -651,14 +819,23 @@ impl HttpClient {
         match &result {
             Ok(bytes) => {
                 let e = AuditLog::post_request_entry(
-                    &target, "RAW", &audit_url, Some(&note),
-                    if bytes.is_empty() { 0 } else { 200 }, elapsed_ms,
+                    &target,
+                    "RAW",
+                    &audit_url,
+                    Some(&note),
+                    if bytes.is_empty() { 0 } else { 200 },
+                    elapsed_ms,
                 );
                 let _ = self.audit.log(&e);
             }
             Err(e) => {
                 let e2 = AuditLog::error_entry(
-                    &target, "RAW", &audit_url, Some(&note), &e.to_string(), Some(elapsed_ms),
+                    &target,
+                    "RAW",
+                    &audit_url,
+                    Some(&note),
+                    &e.to_string(),
+                    Some(elapsed_ms),
                 );
                 let _ = self.audit.log(&e2);
             }
@@ -681,7 +858,10 @@ impl HttpClient {
         port: u16,
         mode: RequestMode,
     ) -> Result<crate::ssh_exec::SshResult, FetchError> {
-        let pre_flight = self.pre_flight_check(url, mode)?;
+        // SSH command execution is action-bearing — enforce the armed gate even
+        // in Passive mode (require_armed = true), so Passive can never be used
+        // to run commands against an unarmed target.
+        let pre_flight = self.pre_flight_check_inner(url, mode, true, true)?;
         let target = &pre_flight.target_handle;
 
         let parsed = url::Url::parse(url)
@@ -692,7 +872,7 @@ impl HttpClient {
             .to_string();
 
         let audit_target = format!("ssh://{host}:{port}");
-        let audit_cmd = format!("ssh {username}@{host} -- {command}");  // no password
+        let audit_cmd = format!("ssh {username}@{host} -- {command}"); // no password
         let pre_entry = AuditLog::pre_request_entry(target, "SSH", &audit_target, Some(&audit_cmd));
         if let Err(e) = self.audit.log(&pre_entry) {
             if mode == RequestMode::Active {
@@ -708,20 +888,66 @@ impl HttpClient {
         match &result {
             Ok(r) => {
                 let e = AuditLog::post_request_entry(
-                    target, "SSH", &audit_target, Some(&audit_cmd),
-                    if r.exit_status == 0 { 200 } else { 500 }, elapsed_ms,
+                    target,
+                    "SSH",
+                    &audit_target,
+                    Some(&audit_cmd),
+                    if r.exit_status == 0 { 200 } else { 500 },
+                    elapsed_ms,
                 );
                 let _ = self.audit.log(&e);
             }
             Err(e) => {
                 let e2 = AuditLog::error_entry(
-                    target, "SSH", &audit_target, Some(&audit_cmd), &e.to_string(),
+                    target,
+                    "SSH",
+                    &audit_target,
+                    Some(&audit_cmd),
+                    &e.to_string(),
                     Some(elapsed_ms),
                 );
                 let _ = self.audit.log(&e2);
             }
         }
         result
+    }
+
+    /// The scope checker for a resolved target handle, if any.
+    fn checker_for_handle(&self, handle: &str) -> Option<&ScopeChecker> {
+        self.targets
+            .iter()
+            .find(|t| t.handle == handle)
+            .map(|t| &t.scope_checker)
+    }
+
+    /// Authorize the literal request-line `raw_path` that a raw/verbatim
+    /// primitive will send, against `handle`'s scope. Unlike the pre-flight
+    /// (which checks the `url`'s own path), this checks the path that actually
+    /// goes out — closing the gap where a path-restricted scope is satisfied by
+    /// an in-prefix `url` while the raw path lands elsewhere on the host.
+    fn authorize_raw_path(
+        &self,
+        handle: &str,
+        url: &str,
+        raw_path: &str,
+    ) -> Result<(), FetchError> {
+        let checker = self
+            .checker_for_handle(handle)
+            .ok_or_else(|| FetchError::NoMatchingTarget(url.to_string()))?;
+        checker.check_raw_path(url, raw_path).map_err(|e| match e {
+            crate::scope::ScopeError::ExplicitlyDenied(m) => FetchError::ScopeViolation(m),
+            other => FetchError::ScopeViolation(other.to_string()),
+        })
+    }
+
+    /// Whether `handle`'s scope authorizes `url`'s host only under a path prefix
+    /// more specific than `/` — i.e. it does NOT grant arbitrary paths on the
+    /// host. Verbatim primitives use this to decide whether their payload paths
+    /// need per-request-line authorization.
+    fn scope_is_path_restricted(&self, handle: &str, url: &str) -> bool {
+        self.checker_for_handle(handle)
+            .map(|c| c.requires_path_check(url))
+            .unwrap_or(true)
     }
 
     /// Resolve which target's scope checker matches this URL.
@@ -810,16 +1036,14 @@ impl HttpClient {
                 let resp_headers = collect_headers(&resp);
 
                 // Read body with size limit (10MB)
-                let body = resp
-                    .into_string()
-                    .map_err(|e| FetchError::HttpError(format!("Failed to read response body: {e}")))?;
+                let body = resp.into_string().map_err(|e| {
+                    FetchError::HttpError(format!("Failed to read response body: {e}"))
+                })?;
 
-                // Truncate if over 10MB (shouldn't happen with ureq defaults but safety)
-                let body = if body.len() > 10_000_000 {
-                    body[..10_000_000].to_string()
-                } else {
-                    body
-                };
+                // Truncate if over 10MB (shouldn't happen with ureq defaults but
+                // safety). Snap to a char boundary — a multi-byte char straddling
+                // byte 10_000_000 would panic a raw `body[..10_000_000]`.
+                let body = truncate_on_char_boundary(body, 10_000_000);
 
                 Ok(HttpResponse {
                     status,
@@ -897,9 +1121,7 @@ impl HttpClient {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let wait = {
-                let mut limiter = self.limiter.lock().map_err(|e| {
-                    FetchError::HttpError(format!("Rate limiter lock poisoned: {e}"))
-                })?;
+                let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
                 match limiter.try_acquire(&target) {
                     Ok(()) => return Ok(()),
                     Err(RateLimitError::RetryAfter(d)) => d,
@@ -945,8 +1167,13 @@ impl HttpClient {
         // baseline aborts the sweep.
         let baseline_resp: Option<HttpResponse> = match baseline {
             Some(b) => {
-                let (res, elapsed) =
-                    self.fetch_timed_with_backoff(&b.method, &b.url, &b.headers, b.body.as_deref(), mode);
+                let (res, elapsed) = self.fetch_timed_with_backoff(
+                    &b.method,
+                    &b.url,
+                    &b.headers,
+                    b.body.as_deref(),
+                    mode,
+                );
                 let mut r = res?;
                 r.elapsed_ms = elapsed;
                 Some(r)
@@ -987,8 +1214,14 @@ impl HttpClient {
                                 Ok(resp) => {
                                     let diff_json = baseline_ref.map(|b| {
                                         let d = crate::diff::diff_responses(
-                                            b.status, &b.headers, &b.body, 0, resp.status,
-                                            &resp.headers, &resp.body, 0,
+                                            b.status,
+                                            &b.headers,
+                                            &b.body,
+                                            0,
+                                            resp.status,
+                                            &resp.headers,
+                                            &resp.body,
+                                            0,
                                         );
                                         serde_json::to_string(&d).unwrap_or_default()
                                     });
@@ -1052,10 +1285,22 @@ impl HttpClient {
         if count == 0 {
             return Ok(Vec::new());
         }
-        // Fail fast on scope/armed once — every request is identical.
+        // Bound the wave: burst spawns one OS thread per request, so an
+        // unbounded caller-controlled `count` is a local resource-exhaustion
+        // vector. Cap it (raise via MOLLY_BURST_MAX) and refuse past the cap.
+        let max_burst = env_usize("MOLLY_BURST_MAX", 256);
+        if count > max_burst {
+            return Err(FetchError::HttpError(format!(
+                "burst: count {count} exceeds the maximum wave size {max_burst} \
+                 (raise it with MOLLY_BURST_MAX)"
+            )));
+        }
+        // Fail fast on scope/armed once — every request is identical. A
+        // barrier-synchronized wave is an action (TOCTOU/race attack), so the
+        // armed gate is enforced even in Passive mode (require_armed = true).
         // (No token consumed here; per-thread acquisition happens below when
         // the limiter is being enforced.)
-        self.pre_flight_check_inner(&req.url, mode, false)?;
+        self.pre_flight_check_inner(&req.url, mode, false, true)?;
 
         // Pre-request audit entries, one per wave member, written BEFORE the
         // wave fires — so a mid-wave crash still leaves a record of every
@@ -1086,7 +1331,9 @@ impl HttpClient {
                         // Acquire a token before the barrier if enforcing, so the
                         // wait doesn't push this thread out of the wave.
                         let preflight_err = if enforce_rate {
-                            self.acquire_token_blocking(&req.url).err().map(|e| e.to_string())
+                            self.acquire_token_blocking(&req.url)
+                                .err()
+                                .map(|e| e.to_string())
                         } else {
                             None
                         };
@@ -1104,16 +1351,23 @@ impl HttpClient {
                             };
                         }
                         let call_start = Instant::now();
-                        let res = self.execute_request(
-                            &req.method,
-                            &req.url,
-                            &req.headers,
-                            req.body.as_deref().map_or(ReqBody::None, ReqBody::Text),
-                        );
+                        // Catch a panic in the request path so one worker's
+                        // panic becomes an error outcome for that index, not a
+                        // panic of the whole burst() call (matching sweep). The
+                        // sync points (token acquire, barrier) already ran, so
+                        // this can't deadlock the wave.
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.execute_request(
+                                &req.method,
+                                &req.url,
+                                &req.headers,
+                                req.body.as_deref().map_or(ReqBody::None, ReqBody::Text),
+                            )
+                        }));
                         let elapsed_ms = call_start.elapsed().as_millis() as u64;
                         let recv_offset_ns = t0.elapsed().as_nanos();
                         match res {
-                            Ok(resp) => BurstOutcome {
+                            Ok(Ok(resp)) => BurstOutcome {
                                 index: idx,
                                 status: resp.status,
                                 body: resp.body,
@@ -1122,7 +1376,7 @@ impl HttpClient {
                                 elapsed_ms,
                                 error: None,
                             },
-                            Err(e) => BurstOutcome {
+                            Ok(Err(e)) => BurstOutcome {
                                 index: idx,
                                 status: 0,
                                 body: String::new(),
@@ -1131,11 +1385,33 @@ impl HttpClient {
                                 elapsed_ms,
                                 error: Some(e.to_string()),
                             },
+                            Err(_) => BurstOutcome {
+                                index: idx,
+                                status: 0,
+                                body: String::new(),
+                                send_offset_ns,
+                                recv_offset_ns,
+                                elapsed_ms,
+                                error: Some("burst worker panicked".to_string()),
+                            },
                         }
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| BurstOutcome {
+                        index: usize::MAX,
+                        status: 0,
+                        body: String::new(),
+                        send_offset_ns: 0,
+                        recv_offset_ns: 0,
+                        elapsed_ms: 0,
+                        error: Some("burst worker thread panicked".to_string()),
+                    })
+                })
+                .collect()
         });
 
         // Audit the wave post-hoc (best effort) — keep the trail even though we
@@ -1144,10 +1420,20 @@ impl HttpClient {
         for o in &results {
             let entry = match &o.error {
                 Some(err) => AuditLog::error_entry(
-                    &target, &req.method, &req.url, req.body.as_deref(), err, Some(o.elapsed_ms),
+                    &target,
+                    &req.method,
+                    &req.url,
+                    req.body.as_deref(),
+                    err,
+                    Some(o.elapsed_ms),
                 ),
                 None => AuditLog::post_request_entry(
-                    &target, &req.method, &req.url, req.body.as_deref(), o.status, o.elapsed_ms,
+                    &target,
+                    &req.method,
+                    &req.url,
+                    req.body.as_deref(),
+                    o.status,
+                    o.elapsed_ms,
                 ),
             };
             let _ = self.audit.log(&entry);
@@ -1179,13 +1465,14 @@ mod tests {
         // at test-process exit, which is fine for a test.
         let dir = tempfile::tempdir().unwrap().keep();
 
-        let client = HttpClient::new(
-            targets,
-            armed.clone(),
-            limiter.clone(),
-            dir,
-        )
-        .unwrap();
+        // Serialize construction against scope-lock tests that transiently set
+        // MOLLY_ENV=staging — HttpClient::new reads it for the hard scope lock.
+        let client = {
+            let _env = crate::scope_lock::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            HttpClient::new(targets, armed.clone(), limiter.clone(), dir).unwrap()
+        };
 
         (client, armed, limiter)
     }
@@ -1225,13 +1512,18 @@ mod tests {
         let limiter = Arc::new(Mutex::new(RateLimiter::new(&[("example".into(), 10.0)])));
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().join("audit");
-        let client = HttpClient::new(
-            vec![("example".into(), vec!["example.com".into()], 10.0)],
-            armed.clone(),
-            limiter.clone(),
-            audit_dir.clone(),
-        )
-        .unwrap();
+        let client = {
+            let _env = crate::scope_lock::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            HttpClient::new(
+                vec![("example".into(), vec!["example.com".into()], 10.0)],
+                armed.clone(),
+                limiter.clone(),
+                audit_dir.clone(),
+            )
+            .unwrap()
+        };
 
         // Remove the audit directory out from under the client so the
         // pre-request append fails with a filesystem error.
@@ -1244,6 +1536,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_enforces_scope_lock_in_staging() {
+        // The MOLLY_ENV=staging hard lock must be enforced by the pure-Rust
+        // constructor, not only the PyO3 one: a non-allowlisted host is refused.
+        let _env = crate::scope_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOLLY_ENV").ok();
+        std::env::set_var("MOLLY_ENV", "staging");
+
+        let armed = Arc::new(RwLock::new(ArmedState::new(&["x".to_string()])));
+        let limiter = Arc::new(Mutex::new(RateLimiter::new(&[("x".into(), 10.0)])));
+        let dir = tempfile::tempdir().unwrap().keep();
+        let res = HttpClient::new(
+            vec![("x".into(), vec!["example.com".into()], 10.0)],
+            armed,
+            limiter,
+            dir,
+        );
+
+        // Restore the env BEFORE asserting, so a panic can't leak staging.
+        match prev {
+            Some(v) => std::env::set_var("MOLLY_ENV", v),
+            None => std::env::remove_var("MOLLY_ENV"),
+        }
+        // HttpClient isn't Debug, so don't print the Ok variant.
+        let rejected = matches!(res, Err(FetchError::ScopeViolation(_)));
+        assert!(
+            rejected,
+            "staging lock must reject a non-allowlisted host (was_err={})",
+            res.is_err()
+        );
+    }
+
     // --- Active mode tests (existing behavior) ---
 
     #[test]
@@ -1252,7 +1578,11 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
 
         let result = client.pre_flight_check("https://evil.com/hack", RequestMode::Active);
         assert!(matches!(result, Err(FetchError::NoMatchingTarget(_))));
@@ -1268,9 +1598,14 @@ mod tests {
             )],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
 
-        let result = client.pre_flight_check("https://admin.example.com/secret", RequestMode::Active);
+        let result =
+            client.pre_flight_check("https://admin.example.com/secret", RequestMode::Active);
         assert!(matches!(result, Err(FetchError::ScopeViolation(_))));
     }
 
@@ -1292,8 +1627,16 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
-        armed.write().unwrap().set("example", ArmedLevel::Paused, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Paused, None)
+            .unwrap();
 
         let result = client.pre_flight_check("https://example.com/api", RequestMode::Active);
         assert!(matches!(result, Err(FetchError::Paused(_))));
@@ -1310,7 +1653,11 @@ mod tests {
             &["example".into()],
         );
         let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-        armed.write().unwrap().set("example", ArmedLevel::Armed, Some(past)).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, Some(past))
+            .unwrap();
 
         let result = client.pre_flight_check("https://example.com/api", RequestMode::Active);
         assert!(matches!(result, Err(FetchError::NotArmed(_))));
@@ -1323,7 +1670,11 @@ mod tests {
             &["example".into()],
         );
         let future = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
-        armed.write().unwrap().set("example", ArmedLevel::Armed, Some(future)).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, Some(future))
+            .unwrap();
 
         let result = client.pre_flight_check("https://example.com/api", RequestMode::Active);
         assert!(result.is_ok());
@@ -1335,7 +1686,11 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
 
         let result = client.pre_flight_check("https://example.com/api", RequestMode::Active);
         assert!(result.is_ok());
@@ -1349,18 +1704,24 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 0.5)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
 
         // First request should pass
-        assert!(client.pre_flight_check("https://example.com/1", RequestMode::Active).is_ok());
+        assert!(client
+            .pre_flight_check("https://example.com/1", RequestMode::Active)
+            .is_ok());
         // Drain the bucket
-        while client.pre_flight_check("https://example.com/x", RequestMode::Active).is_ok() {}
+        while client
+            .pre_flight_check("https://example.com/x", RequestMode::Active)
+            .is_ok()
+        {}
 
         let result = client.pre_flight_check("https://example.com/y", RequestMode::Active);
-        assert!(matches!(
-            result,
-            Err(FetchError::RateLimited { .. })
-        ));
+        assert!(matches!(result, Err(FetchError::RateLimited { .. })));
     }
 
     #[test]
@@ -1372,13 +1733,25 @@ mod tests {
             ],
             &["linkedin".into(), "cloudflare".into()],
         );
-        armed.write().unwrap().set("linkedin", ArmedLevel::Armed, None).unwrap();
-        armed.write().unwrap().set("cloudflare", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("linkedin", ArmedLevel::Armed, None)
+            .unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("cloudflare", ArmedLevel::Armed, None)
+            .unwrap();
 
-        let r1 = client.pre_flight_check("https://api.linkedin.com/foo", RequestMode::Active).unwrap();
+        let r1 = client
+            .pre_flight_check("https://api.linkedin.com/foo", RequestMode::Active)
+            .unwrap();
         assert_eq!(r1.target_handle, "linkedin");
 
-        let r2 = client.pre_flight_check("https://dash.cloudflare.com/bar", RequestMode::Active).unwrap();
+        let r2 = client
+            .pre_flight_check("https://dash.cloudflare.com/bar", RequestMode::Active)
+            .unwrap();
         assert_eq!(r2.target_handle, "cloudflare");
     }
 
@@ -1395,12 +1768,20 @@ mod tests {
             ],
             &["doppler-anon".into(), "doppler".into()],
         );
-        armed.write().unwrap().set("doppler", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("doppler", ArmedLevel::Armed, None)
+            .unwrap();
         // doppler-anon stays Unarmed (default)
 
-        let r = client.pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Active).unwrap();
-        assert_eq!(r.target_handle, "doppler",
-            "armed sibling should win over unarmed when scope overlaps");
+        let r = client
+            .pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Active)
+            .unwrap();
+        assert_eq!(
+            r.target_handle, "doppler",
+            "armed sibling should win over unarmed when scope overlaps"
+        );
     }
 
     #[test]
@@ -1416,7 +1797,11 @@ mod tests {
             &["doppler-anon".into(), "doppler".into()],
         );
         let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-        armed.write().unwrap().set("doppler", ArmedLevel::Armed, Some(past)).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("doppler", ArmedLevel::Armed, Some(past))
+            .unwrap();
 
         let r = client.pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Active);
         // Both siblings are now effectively unarmed — pre_flight_check
@@ -1435,9 +1820,15 @@ mod tests {
             ],
             &["doppler".into(), "doppler-anon".into()],
         );
-        armed.write().unwrap().set("doppler", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("doppler", ArmedLevel::Armed, None)
+            .unwrap();
 
-        let r = client.pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Active).unwrap();
+        let r = client
+            .pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Active)
+            .unwrap();
         assert_eq!(r.target_handle, "doppler");
     }
 
@@ -1453,7 +1844,9 @@ mod tests {
             &[],
         );
 
-        let r = client.pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Passive).unwrap();
+        let r = client
+            .pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Passive)
+            .unwrap();
         // Either is acceptable — both unarmed, both match. Test for stability:
         // first-defined wins among unarmed, matching the pre-fix behavior.
         assert!(r.target_handle == "doppler-anon" || r.target_handle == "doppler");
@@ -1471,12 +1864,22 @@ mod tests {
             ],
             &["doppler-anon".into(), "doppler".into()],
         );
-        armed.write().unwrap().set("doppler", ArmedLevel::Armed, None).unwrap();
-        armed.write().unwrap().set("doppler", ArmedLevel::Paused, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("doppler", ArmedLevel::Armed, None)
+            .unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("doppler", ArmedLevel::Paused, None)
+            .unwrap();
 
         // Pre-flight in Passive mode (skips the armed check) — should still
         // resolve to the paused target, not the fully-unarmed sibling.
-        let r = client.pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Passive).unwrap();
+        let r = client
+            .pre_flight_check("https://api.doppler.com/v3/me", RequestMode::Passive)
+            .unwrap();
         assert_eq!(r.target_handle, "doppler");
     }
 
@@ -1486,7 +1889,11 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
 
         let result = client.fetch("FOOBAR", "https://example.com/api", &HashMap::new(), None);
         assert!(matches!(result, Err(FetchError::InvalidMethod(_))));
@@ -1513,8 +1920,16 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
-        armed.write().unwrap().set("example", ArmedLevel::Paused, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Paused, None)
+            .unwrap();
 
         let result = client.pre_flight_check("https://example.com/api", RequestMode::Passive);
         assert!(result.is_ok());
@@ -1542,7 +1957,8 @@ mod tests {
             &["example".into()],
         );
 
-        let result = client.pre_flight_check("https://admin.example.com/secret", RequestMode::Passive);
+        let result =
+            client.pre_flight_check("https://admin.example.com/secret", RequestMode::Passive);
         assert!(matches!(result, Err(FetchError::ScopeViolation(_))));
     }
 
@@ -1554,7 +1970,10 @@ mod tests {
         );
 
         // Drain the bucket
-        while client.pre_flight_check("https://example.com/x", RequestMode::Passive).is_ok() {}
+        while client
+            .pre_flight_check("https://example.com/x", RequestMode::Passive)
+            .is_ok()
+        {}
 
         let result = client.pre_flight_check("https://example.com/y", RequestMode::Passive);
         assert!(matches!(result, Err(FetchError::RateLimited { .. })));
@@ -1562,9 +1981,18 @@ mod tests {
 
     #[test]
     fn request_mode_from_str() {
-        assert_eq!(RequestMode::from_str("active").unwrap(), RequestMode::Active);
-        assert_eq!(RequestMode::from_str("PASSIVE").unwrap(), RequestMode::Passive);
-        assert_eq!(RequestMode::from_str("Passive").unwrap(), RequestMode::Passive);
+        assert_eq!(
+            RequestMode::from_str("active").unwrap(),
+            RequestMode::Active
+        );
+        assert_eq!(
+            RequestMode::from_str("PASSIVE").unwrap(),
+            RequestMode::Passive
+        );
+        assert_eq!(
+            RequestMode::from_str("Passive").unwrap(),
+            RequestMode::Passive
+        );
         assert!(RequestMode::from_str("invalid").is_err());
     }
 
@@ -1601,10 +2029,18 @@ mod tests {
         });
 
         let (client, armed, _) = make_client(
-            vec![("local".into(), vec![format!("http://127.0.0.1:{port}/*")], 10.0)],
+            vec![(
+                "local".into(),
+                vec![format!("http://127.0.0.1:{port}/*")],
+                10.0,
+            )],
             &["local".into()],
         );
-        armed.write().unwrap().set("local", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
 
         let resp = client
             .fetch_with_mode(
@@ -1618,9 +2054,18 @@ mod tests {
 
         server.join().unwrap();
 
-        let cookies = resp.headers.get("set-cookie").expect("set-cookie header missing");
-        assert!(cookies.contains("session=abc123"), "cookies was: {cookies:?}");
-        assert!(cookies.contains("csrftoken=xyz789"), "cookies was: {cookies:?}");
+        let cookies = resp
+            .headers
+            .get("set-cookie")
+            .expect("set-cookie header missing");
+        assert!(
+            cookies.contains("session=abc123"),
+            "cookies was: {cookies:?}"
+        );
+        assert!(
+            cookies.contains("csrftoken=xyz789"),
+            "cookies was: {cookies:?}"
+        );
         assert_eq!(
             cookies.matches('\n').count(),
             1,
@@ -1654,10 +2099,18 @@ mod tests {
         });
 
         let (client, armed, _) = make_client(
-            vec![("local".into(), vec![format!("http://127.0.0.1:{port}/*")], 10.0)],
+            vec![(
+                "local".into(),
+                vec![format!("http://127.0.0.1:{port}/*")],
+                10.0,
+            )],
             &["local".into()],
         );
-        armed.write().unwrap().set("local", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
 
         // JPEG magic 0xFF 0xD8 + text — exactly the payload a UTF-8 str body mangles.
         let payload: Vec<u8> = vec![0xFF, 0xD8, b'<', b'?', b'p', b'h', b'p'];
@@ -1687,9 +2140,19 @@ mod tests {
             &["local".into()],
         );
         let err = client
-            .ssh_exec_gated("http://127.0.0.1:1/", "pedro", "pw", "id", 22, RequestMode::Active)
+            .ssh_exec_gated(
+                "http://127.0.0.1:1/",
+                "pedro",
+                "pw",
+                "id",
+                22,
+                RequestMode::Active,
+            )
             .unwrap_err();
-        assert!(matches!(err, FetchError::NotArmed(_)), "expected NotArmed, got {err:?}");
+        assert!(
+            matches!(err, FetchError::NotArmed(_)),
+            "expected NotArmed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1700,11 +2163,25 @@ mod tests {
             vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
             &["local".into()],
         );
-        armed.write().unwrap().set("local", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
         let err = client
-            .ssh_exec_gated("http://evil.example.com/", "u", "p", "id", 22, RequestMode::Active)
+            .ssh_exec_gated(
+                "http://evil.example.com/",
+                "u",
+                "p",
+                "id",
+                22,
+                RequestMode::Active,
+            )
             .unwrap_err();
-        assert!(matches!(err, FetchError::NoMatchingTarget(_)), "expected scope reject, got {err:?}");
+        assert!(
+            matches!(err, FetchError::NoMatchingTarget(_)),
+            "expected scope reject, got {err:?}"
+        );
     }
 
     #[test]
@@ -1723,7 +2200,10 @@ mod tests {
                 RequestMode::Active,
             )
             .unwrap_err();
-        assert!(matches!(err, FetchError::NotArmed(_)), "expected NotArmed, got {err:?}");
+        assert!(
+            matches!(err, FetchError::NotArmed(_)),
+            "expected NotArmed, got {err:?}"
+        );
     }
 
     // --- sweep / burst (deterministic concurrency primitives) ---
@@ -1775,10 +2255,18 @@ mod tests {
 
     fn armed_client(port: u16, rps: f64) -> HttpClient {
         let (client, armed, _) = make_client(
-            vec![("local".into(), vec![format!("http://127.0.0.1:{port}/*")], rps)],
+            vec![(
+                "local".into(),
+                vec![format!("http://127.0.0.1:{port}/*")],
+                rps,
+            )],
             &["local".into()],
         );
-        armed.write().unwrap().set("local", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
         client
     }
 
@@ -1795,7 +2283,9 @@ mod tests {
     fn sweep_runs_all_and_preserves_order() {
         let port = spawn_multi_server(5, 0);
         let client = armed_client(port, 100.0);
-        let muts: Vec<Req> = (0..5).map(|i| get_req(port, &format!("/item/{i}"))).collect();
+        let muts: Vec<Req> = (0..5)
+            .map(|i| get_req(port, &format!("/item/{i}")))
+            .collect();
 
         let out = client.sweep(None, &muts, 4, RequestMode::Active).unwrap();
 
@@ -1803,7 +2293,11 @@ mod tests {
         for (i, o) in out.iter().enumerate() {
             assert_eq!(o.index, i);
             assert_eq!(o.status, 200, "outcome {i} errored: {:?}", o.error);
-            assert!(o.body.contains(&format!("/item/{i}")), "body was: {}", o.body);
+            assert!(
+                o.body.contains(&format!("/item/{i}")),
+                "body was: {}",
+                o.body
+            );
             assert!(o.error.is_none());
             assert!(o.diff_json.is_none(), "no baseline was supplied");
         }
@@ -1867,7 +2361,10 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, 0);
-        assert!(out[0].error.is_some(), "a refused connection should surface an error");
+        assert!(
+            out[0].error.is_some(),
+            "a refused connection should surface an error"
+        );
     }
 
     #[test]
@@ -1877,10 +2374,15 @@ mod tests {
         let baseline = get_req(port, "/a");
         let muts = vec![get_req(port, "/aaaaaaaaaaaaaaaaaaaa")]; // longer echoed path
 
-        let out = client.sweep(Some(&baseline), &muts, 1, RequestMode::Active).unwrap();
+        let out = client
+            .sweep(Some(&baseline), &muts, 1, RequestMode::Active)
+            .unwrap();
 
         assert_eq!(out.len(), 1);
-        let dj = out[0].diff_json.as_ref().expect("baseline supplied => diff present");
+        let dj = out[0]
+            .diff_json
+            .as_ref()
+            .expect("baseline supplied => diff present");
         assert!(dj.contains("\"verdict\""), "diff json: {dj}");
         assert!(dj.contains("body_len_delta"), "diff json: {dj}");
     }
@@ -1900,7 +2402,9 @@ mod tests {
         assert!(
             out.iter().all(|o| o.status == 200),
             "errors: {:?}",
-            out.iter().filter_map(|o| o.error.as_ref()).collect::<Vec<_>>()
+            out.iter()
+                .filter_map(|o| o.error.as_ref())
+                .collect::<Vec<_>>()
         );
         let sends: Vec<u128> = out.iter().map(|o| o.send_offset_ns).collect();
         let spread_ms = (sends.iter().max().unwrap() - sends.iter().min().unwrap()) as f64 / 1e6;
@@ -1999,7 +2503,11 @@ mod tests {
             vec![("example".into(), vec!["example.com".into()], 10.0)],
             &["example".into()],
         );
-        armed.write().unwrap().set("example", ArmedLevel::Armed, None).unwrap();
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
         let r = client.fetch_fair(
             "GET",
             "https://evil.com/hack",
@@ -2008,7 +2516,10 @@ mod tests {
             RequestMode::Active,
             0,
         );
-        assert!(matches!(r, Err(FetchError::NoMatchingTarget(_))), "got {r:?}");
+        assert!(
+            matches!(r, Err(FetchError::NoMatchingTarget(_))),
+            "got {r:?}"
+        );
     }
 
     #[test]
@@ -2047,5 +2558,368 @@ mod tests {
             "shared bucket should pace both producers; took {:?}",
             start.elapsed()
         );
+    }
+
+    // --- F2: Passive mode must not ungate offensive / mutating operations -----
+
+    #[test]
+    fn passive_mode_enforces_armed_for_mutating_method() {
+        // A POST is action-bearing — Passive must NOT skip the armed gate for it.
+        let (client, _armed, _) = make_client(
+            vec![("example".into(), vec!["example.com".into()], 10.0)],
+            &["example".into()],
+        );
+        let err = client
+            .fetch_with_mode(
+                "POST",
+                "https://example.com/api",
+                &HashMap::new(),
+                Some("x"),
+                RequestMode::Passive,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotArmed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn passive_mode_still_allows_readonly_recon_on_unarmed_target() {
+        // GET/HEAD/OPTIONS recon stays armed-exempt in Passive: an unarmed but
+        // scoped target must get PAST the armed gate (it then fails at the
+        // network layer against a dead port, not with NotArmed).
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .fetch_with_mode(
+                "GET",
+                "http://127.0.0.1:1/",
+                &HashMap::new(),
+                None,
+                RequestMode::Passive,
+            )
+            .unwrap_err();
+        assert!(
+            !matches!(err, FetchError::NotArmed(_)),
+            "read-only recon must not be armed-gated in Passive; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn passive_mode_ssh_exec_requires_armed() {
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .ssh_exec_gated(
+                "http://127.0.0.1:1/",
+                "pedro",
+                "pw",
+                "id",
+                22,
+                RequestMode::Passive,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotArmed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn passive_mode_raw_exchange_requires_armed() {
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .raw_exchange(
+                "http://127.0.0.1:1/",
+                &[b"GET / HTTP/1.1\r\n\r\n".to_vec()],
+                1,
+                0,
+                4096,
+                RequestMode::Passive,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotArmed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn passive_mode_fetch_raw_path_requires_armed() {
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .fetch_raw_path(
+                "GET",
+                "http://127.0.0.1:1/",
+                "/",
+                &HashMap::new(),
+                None,
+                RequestMode::Passive,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotArmed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn passive_mode_burst_requires_armed() {
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .burst(&get_req_at(1, "/"), 2, true, RequestMode::Passive)
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotArmed(_)), "got {err:?}");
+    }
+
+    fn get_req_at(port: u16, path: &str) -> Req {
+        Req {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}{path}"),
+            headers: HashMap::new(),
+            body: None,
+        }
+    }
+
+    // --- F3: raw primitives authorize the path they actually send ------------
+
+    #[test]
+    fn fetch_raw_path_rejects_out_of_prefix_path() {
+        // Scope is path-restricted to /api/*. An in-prefix url passes pre-flight,
+        // but a raw_path that escapes the prefix must be refused BEFORE sending.
+        let (client, armed, _) = make_client(
+            vec![(
+                "local".into(),
+                vec!["http://127.0.0.1:1/api/*".into()],
+                10.0,
+            )],
+            &["local".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
+        let err = client
+            .fetch_raw_path(
+                "GET",
+                "http://127.0.0.1:1/api/x",
+                "/admin/secret",
+                &HashMap::new(),
+                None,
+                RequestMode::Active,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::ScopeViolation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn fetch_raw_path_allows_in_prefix_path() {
+        // An in-prefix raw_path is authorized (it then fails at the dead port,
+        // not with a scope violation).
+        let (client, armed, _) = make_client(
+            vec![(
+                "local".into(),
+                vec!["http://127.0.0.1:1/api/*".into()],
+                10.0,
+            )],
+            &["local".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
+        let err = client
+            .fetch_raw_path(
+                "GET",
+                "http://127.0.0.1:1/api/x",
+                "/api/ok",
+                &HashMap::new(),
+                None,
+                RequestMode::Active,
+            )
+            .unwrap_err();
+        assert!(
+            !matches!(err, FetchError::ScopeViolation(_)),
+            "in-prefix raw path must be authorized; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_exchange_rejects_out_of_prefix_request_line() {
+        let (client, armed, _) = make_client(
+            vec![(
+                "local".into(),
+                vec!["http://127.0.0.1:1/api/*".into()],
+                10.0,
+            )],
+            &["local".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
+        let err = client
+            .raw_exchange(
+                "http://127.0.0.1:1/api/x",
+                &[b"GET /admin HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()],
+                1,
+                0,
+                4096,
+                RequestMode::Active,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::ScopeViolation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn raw_exchange_host_scope_allows_any_request_line() {
+        // A `/*` (host-wide) scope imposes no path restriction, so the verbatim
+        // request line is not path-checked (it then fails at the dead port).
+        let (client, armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
+        let err = client
+            .raw_exchange(
+                "http://127.0.0.1:1/",
+                &[b"GET /admin HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()],
+                1,
+                0,
+                4096,
+                RequestMode::Active,
+            )
+            .unwrap_err();
+        assert!(
+            !matches!(err, FetchError::ScopeViolation(_)),
+            "host-wide scope must not path-check raw payloads; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn request_line_targets_parses_pipelined_requests() {
+        let payload = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        let targets = request_line_targets(payload);
+        assert_eq!(targets, Some(vec!["/a".to_string(), "/b".to_string()]));
+    }
+
+    #[test]
+    fn request_line_targets_collects_non_uppercase_method_decoys() {
+        // A lowercase/odd-case method must NOT escape collection — the old
+        // uppercase-only check let a decoy line smuggle an unauthorized path.
+        let payload = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nget /admin HTTP/1.1\r\nHost: x\r\n\r\n";
+        let targets = request_line_targets(payload);
+        assert_eq!(targets, Some(vec!["/a".to_string(), "/admin".to_string()]));
+    }
+
+    #[test]
+    fn request_line_targets_fails_closed_on_malformed_request_line() {
+        // A line that ends in an HTTP version token but can't yield a target is
+        // a refusal (None), not a silent skip.
+        let payload = b"BOGUS HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(request_line_targets(payload), None);
+    }
+
+    #[test]
+    fn raw_exchange_rejects_decoy_request_line_under_restricted_scope() {
+        // A good in-prefix line plus a lowercase out-of-prefix decoy must be
+        // refused — the decoy is now collected and fails the path check.
+        let (client, armed, _) = make_client(
+            vec![(
+                "local".into(),
+                vec!["http://127.0.0.1:1/api/*".into()],
+                10.0,
+            )],
+            &["local".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("local", ArmedLevel::Armed, None)
+            .unwrap();
+        let payload =
+            b"GET /api/ok HTTP/1.1\r\nHost: x\r\n\r\nget /admin HTTP/1.1\r\nHost: x\r\n\r\n"
+                .to_vec();
+        let err = client
+            .raw_exchange(
+                "http://127.0.0.1:1/api/x",
+                &[payload],
+                1,
+                0,
+                4096,
+                RequestMode::Active,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FetchError::ScopeViolation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn burst_rejects_oversized_count() {
+        // A caller-controlled count beyond the cap is refused before any thread
+        // is spawned (local DoS guard).
+        let (client, _armed, _) = make_client(
+            vec![("local".into(), vec!["http://127.0.0.1:1/*".into()], 10.0)],
+            &["local".into()],
+        );
+        let err = client
+            .burst(&get_req_at(1, "/"), 10_000, true, RequestMode::Active)
+            .unwrap_err();
+        assert!(matches!(err, FetchError::HttpError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn recovers_from_a_poisoned_armed_lock() {
+        // A panic elsewhere that poisons the armed lock must not permanently
+        // brick the gate — pre-flight recovers the poison.
+        let (client, armed, _) = make_client(
+            vec![("example".into(), vec!["example.com".into()], 10.0)],
+            &["example".into()],
+        );
+        armed
+            .write()
+            .unwrap()
+            .set("example", ArmedLevel::Armed, None)
+            .unwrap();
+
+        let armed2 = armed.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = armed2.write().unwrap();
+            panic!("poison the armed lock");
+        })
+        .join();
+        assert!(armed.is_poisoned(), "precondition: lock should be poisoned");
+
+        let r = client.pre_flight_check("https://example.com/api", RequestMode::Active);
+        assert!(r.is_ok(), "poisoned lock should be recovered, got {r:?}");
+    }
+
+    // --- F7: response-body truncation never splits a UTF-8 codepoint ----------
+
+    #[test]
+    fn truncate_on_char_boundary_snaps_down() {
+        // "aéb" = a(1) é(2 bytes) b(1); char boundaries at 0,1,3,4.
+        assert_eq!(truncate_on_char_boundary("aéb".to_string(), 2), "a"); // 2 is mid-é
+        assert_eq!(truncate_on_char_boundary("aéb".to_string(), 3), "aé");
+        assert_eq!(truncate_on_char_boundary("aéb".to_string(), 100), "aéb"); // no-op
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_matches_the_body_cap_shape() {
+        // Mirrors execute_request's 10MB cap with a multi-byte char straddling
+        // the limit: must not panic and must stay valid UTF-8 at/below the cap.
+        let cap = 10_000_000usize;
+        let s = format!("{}é{}", "a".repeat(cap - 1), "b".repeat(10));
+        let out = truncate_on_char_boundary(s, cap);
+        assert!(out.len() <= cap);
+        assert!(out.is_char_boundary(out.len()));
     }
 }

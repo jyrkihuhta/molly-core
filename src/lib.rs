@@ -1,3 +1,8 @@
+// The pure-Rust crate contains no `unsafe`; forbid it so a regression is a
+// compile error. The optional `python` feature pulls in PyO3, whose macros
+// generate `unsafe`, so the forbid is lifted only for that build.
+#![cfg_attr(not(feature = "python"), forbid(unsafe_code))]
+
 //! # molly-core
 //!
 //! A Rust-enforced **safety cage** for autonomous agents that make outbound
@@ -34,7 +39,13 @@ pub mod audit;
 pub mod diff;
 pub mod fetch;
 pub mod rate_limiter;
-pub mod raw_request;
+// Ungated verbatim transports. They are reachable ONLY through the gated
+// `HttpClient` methods that run the full pre-flight first, never directly:
+// `raw_request` is crate-private, and `ssh_exec`'s egress function is
+// `pub(crate)` (its `SshResult` type stays public as a return type). This is
+// what makes "HttpClient is the only egress" true for a Rust consumer, not just
+// for the PyO3 surface.
+pub(crate) mod raw_request;
 pub mod scope;
 pub mod scope_lock;
 pub mod ssh_exec;
