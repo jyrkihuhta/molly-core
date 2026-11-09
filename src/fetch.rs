@@ -71,6 +71,13 @@ pub enum RequestMode {
     /// Read-only recon: scope + rate limit + audit, with the armed gate skipped
     /// — but only for GET/HEAD/OPTIONS. Lets enumeration run on a scoped-but-
     /// unarmed host; it can never fire an action-bearing request at one.
+    ///
+    /// Audit note: the pre-request "log before it leaves the box" write is
+    /// fail-**closed** only in `Active` mode. In `Passive` mode a failed
+    /// pre-request audit write is best-effort — the request still goes out — a
+    /// deliberate asymmetry: failing read-only recon on a transient log error is
+    /// judged worse than a logging gap. Use `Active` where every request must be
+    /// provably logged.
     Passive,
 }
 
@@ -489,10 +496,13 @@ impl HttpClient {
         priority: i64,
     ) -> Result<HttpResponse, FetchError> {
         // Fail fast on scope/armed before we ever queue or consume a token. A
-        // mutating method must pass the armed gate even in Passive mode.
-        self.pre_flight_check_inner(url, mode, false, !method_is_read_only(method))?;
+        // mutating method must pass the armed gate even in Passive mode. Resolve
+        // the target once here and reuse it for admission (no re-resolve).
+        let target = self
+            .pre_flight_check_inner(url, mode, false, !method_is_read_only(method))?
+            .target_handle;
         // Fair, blocking rate admission (consumes the token honoring priority+FIFO).
-        self.fair_admit(url, priority)?;
+        self.fair_admit_for(&target, priority)?;
         // Audit + execute; enforce_rate=false — fair_admit already took the token.
         let req_body = body.map_or(ReqBody::None, ReqBody::Text);
         self.fetch_core(method, url, headers, req_body, body, mode, false)
@@ -505,13 +515,12 @@ impl HttpClient {
     /// global lock and never stalls other targets. The wait budget is
     /// `MOLLY_FAIR_ADMISSION_MAX_WAIT_SECS` (default 60s, floor 1s); on the
     /// deadline it returns `RateLimited` carrying the remaining token-wait.
-    fn fair_admit(&self, url: &str, priority: i64) -> Result<(), FetchError> {
-        let target = self.resolve_target(url)?;
+    fn fair_admit_for(&self, target: &str, priority: i64) -> Result<(), FetchError> {
         let bucket = {
             let limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
-            limiter.bucket_for(&target)
+            limiter.bucket_for(target)
         };
-        let bucket = bucket.ok_or_else(|| FetchError::NoMatchingTarget(target.clone()))?;
+        let bucket = bucket.ok_or_else(|| FetchError::NoMatchingTarget(target.to_string()))?;
         let max_wait = env_duration_secs("MOLLY_FAIR_ADMISSION_MAX_WAIT_SECS", 60, 1);
         // Guard against Instant + Duration overflow on an absurdly large env
         // value: fall back to a sane cap rather than panicking.
@@ -521,7 +530,7 @@ impl HttpClient {
         bucket
             .acquire_blocking(priority, deadline)
             .map_err(|remaining| FetchError::RateLimited {
-                target,
+                target: target.to_string(),
                 retry_after_ms: remaining.as_millis() as u64,
             })
     }
@@ -781,9 +790,10 @@ impl HttpClient {
         let port = parsed.port_or_known_default().unwrap_or(80);
 
         // 3. Rate: one token PER payload, acquired up front so no rate-sleep desyncs the
-        //    timing-sensitive exchange (acquire_token_blocking resolves the same target).
+        //    timing-sensitive exchange. Reuse the already-resolved `target` so the
+        //    scope isn't re-resolved once per payload.
         for _ in 0..payloads.len() {
-            self.acquire_token_blocking(url)?;
+            self.acquire_token_blocking_for(&target)?;
         }
 
         // 4. Fail-closed pre-audit (log BEFORE the bytes leave). One entry; the raw bytes
@@ -1118,11 +1128,18 @@ impl HttpClient {
     /// doesn't desync the simultaneous fire).
     fn acquire_token_blocking(&self, url: &str) -> Result<(), FetchError> {
         let target = self.resolve_target(url)?;
+        self.acquire_token_blocking_for(&target)
+    }
+
+    /// Like `acquire_token_blocking`, but for an already-resolved target handle —
+    /// so callers that resolved once (e.g. `raw_exchange`, which acquires one
+    /// token per payload) don't re-resolve the scope on every acquisition.
+    fn acquire_token_blocking_for(&self, target: &str) -> Result<(), FetchError> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let wait = {
                 let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
-                match limiter.try_acquire(&target) {
+                match limiter.try_acquire(target) {
                     Ok(()) => return Ok(()),
                     Err(RateLimitError::RetryAfter(d)) => d,
                     Err(RateLimitError::UnknownTarget(t)) => {
@@ -1132,7 +1149,7 @@ impl HttpClient {
             };
             if Instant::now() + wait > deadline {
                 return Err(FetchError::RateLimited {
-                    target,
+                    target: target.to_string(),
                     retry_after_ms: wait.as_millis() as u64,
                 });
             }
@@ -1185,7 +1202,12 @@ impl HttpClient {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let worker_count = workers.clamp(1, n);
+        // Cap the OS-thread fan-out: `workers` is clamped to the mutation count,
+        // but a huge `mutations` list would otherwise spawn one thread each.
+        // Bound it (raise via MOLLY_SWEEP_MAX_WORKERS); results are unaffected —
+        // fewer workers just means each drains more of the shared cursor.
+        let max_workers = env_usize("MOLLY_SWEEP_MAX_WORKERS", 64);
+        let worker_count = workers.clamp(1, n).min(max_workers);
         let cursor = AtomicUsize::new(0);
         let baseline_ref = baseline_resp.as_ref();
 
@@ -1299,8 +1321,11 @@ impl HttpClient {
         // barrier-synchronized wave is an action (TOCTOU/race attack), so the
         // armed gate is enforced even in Passive mode (require_armed = true).
         // (No token consumed here; per-thread acquisition happens below when
-        // the limiter is being enforced.)
-        self.pre_flight_check_inner(&req.url, mode, false, true)?;
+        // the limiter is being enforced.) Resolve the target once and reuse it
+        // for the audit trail and every thread's token acquisition.
+        let target = self
+            .pre_flight_check_inner(&req.url, mode, false, true)?
+            .target_handle;
 
         // Pre-request audit entries, one per wave member, written BEFORE the
         // wave fires — so a mid-wave crash still leaves a record of every
@@ -1308,7 +1333,6 @@ impl HttpClient {
         // to write nothing until after the wave completed. For Active mode
         // this is fail-closed (abort if the trail can't be written), matching
         // fetch_with_mode.
-        let target = self.resolve_target(&req.url).unwrap_or_default();
         for _ in 0..count {
             let pre_entry =
                 AuditLog::pre_request_entry(&target, &req.method, &req.url, req.body.as_deref());
@@ -1322,6 +1346,9 @@ impl HttpClient {
         let enforce_rate = !bypass_rate_limit;
         let barrier = Barrier::new(count);
         let t0 = Instant::now();
+        // A Copy `&str` each worker captures, so they share the one resolved
+        // target without re-resolving the scope per thread.
+        let target_ref: &str = &target;
 
         let mut results: Vec<BurstOutcome> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..count)
@@ -1331,7 +1358,7 @@ impl HttpClient {
                         // Acquire a token before the barrier if enforcing, so the
                         // wait doesn't push this thread out of the wave.
                         let preflight_err = if enforce_rate {
-                            self.acquire_token_blocking(&req.url)
+                            self.acquire_token_blocking_for(target_ref)
                                 .err()
                                 .map(|e| e.to_string())
                         } else {

@@ -33,6 +33,29 @@
 //! The pure-Rust API lives in the modules below and is re-exported here. The
 //! optional `python` feature additionally builds a PyO3 extension module
 //! (`molly_core._core`); it is off by default.
+//!
+//! ## Quickstart
+//!
+//! Compile a scope allowlist and check URLs against it:
+//!
+//! ```
+//! use molly_core::scope::ScopeChecker;
+//!
+//! let scope = ScopeChecker::new(&[
+//!     "example.com".to_string(),      // exact host
+//!     "*.example.com".to_string(),    // any subdomain
+//!     "!admin.example.com".to_string(), // deny overrides allow
+//! ]);
+//!
+//! assert!(scope.is_allowed("https://example.com/path"));
+//! assert!(scope.is_allowed("https://api.example.com/"));
+//! assert!(!scope.is_allowed("https://admin.example.com/")); // explicitly denied
+//! assert!(!scope.is_allowed("https://evil.com/"));           // not in scope
+//! assert!(!scope.is_allowed("http://example.com/"));         // https-only by default
+//! ```
+//!
+//! From there, a [`fetch::HttpClient`] wires scope together with the armed,
+//! rate-limit, and audit gates; see its docs and `examples/gated_client.rs`.
 
 pub mod armed;
 pub mod audit;
