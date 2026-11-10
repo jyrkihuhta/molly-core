@@ -2,9 +2,11 @@
 //!
 //! Two ways to get a token for a target:
 //!
-//! * [`RateLimiter::try_acquire`] — NON-blocking (unchanged): take a token now or
-//!   report a retry-after duration. The caller (Python `rl_fetch`, the sweep
-//!   backoff) decides whether to wait. No ordering guarantee between callers.
+//! * [`RateLimiter::try_acquire`] — NON-blocking: take a token now or report a
+//!   retry-after duration. The caller (Python `rl_fetch`, the sweep backoff)
+//!   decides whether to wait. No ordering guarantee among non-blocking callers,
+//!   but it yields to the fair queue — if any `acquire_blocking` waiter is
+//!   queued, the fast path backs off instead of stealing the token.
 //!
 //! * [`FairBucket::acquire_blocking`] — the admission QUEUE. The caller blocks
 //!   until it is at the front of the per-target queue AND a token is available
@@ -14,7 +16,8 @@
 //!   fairly, at exactly the rate limit, and a higher-priority request (a flag-read
 //!   probe) jumps ahead of a broad sweep. This is wired into the fetch path via
 //!   [`crate::fetch::HttpClient::fetch_fair`] (opt-in, by passing a `priority`);
-//!   `try_acquire` and the default `fetch` path are unchanged.
+//!   the default `fetch` path uses `try_acquire`, which now yields to any queued
+//!   fair waiter rather than racing it for the token.
 //!
 //! Burst allowance: 2× the per-second rate (2 seconds of burst capacity).
 
@@ -138,13 +141,22 @@ impl FairBucket {
     }
 
     /// Non-blocking: take one token now, or report how long until one is free.
-    /// Ignores the fairness queue by design — this is the legacy fast path.
+    ///
+    /// Yields to the fair admission queue: if any caller is blocked waiting for a
+    /// token (`acquire_blocking`), the fast path does NOT take one ahead of them
+    /// — otherwise a stream of non-blocking callers could starve the fair front
+    /// indefinitely. In that case it returns a retry-after of roughly one refill
+    /// slot, so a backoff caller re-tries after the queue has had its turn.
     fn try_acquire(&self) -> Result<(), Duration> {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return Err(Duration::from_secs_f64(1.0)),
         };
         g.refill();
+        if !g.waiters.is_empty() {
+            let wait = (1.0 / g.refill_rate).max(1e-3);
+            return Err(Duration::from_secs_f64(wait));
+        }
         if g.tokens >= 1.0 {
             g.tokens -= 1.0;
             Ok(())
@@ -318,6 +330,22 @@ mod tests {
         assert!(lim.try_acquire("test-target").is_err());
         std::thread::sleep(Duration::from_millis(200));
         assert!(lim.try_acquire("test-target").is_ok());
+    }
+
+    #[test]
+    fn try_acquire_yields_to_a_queued_fair_waiter() {
+        // Even with tokens available, the non-blocking path must back off when a
+        // fair waiter is queued, rather than steal the token and starve it.
+        let b = FairBucket::new(1000.0); // starts full, plenty of tokens
+        assert!(b.try_acquire().is_ok(), "no waiters -> fast path succeeds");
+        {
+            let mut g = b.inner.lock().unwrap();
+            g.waiters.insert((Reverse(0), 0));
+        }
+        assert!(
+            b.try_acquire().is_err(),
+            "with a waiter queued, the fast path must yield"
+        );
     }
 
     #[test]

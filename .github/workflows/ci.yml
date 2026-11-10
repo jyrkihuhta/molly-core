@@ -42,11 +42,14 @@ jobs:
       - name: Doc tests
         run: cargo test --doc
 
-      # The `python` feature pulls in PyO3. `cargo check` type-checks the
-      # bindings without linking libpython (extension-module), so it validates
-      # the feature builds without needing a Python toolchain here.
-      - name: Type-check the `python` feature
-        run: cargo check --features python
+      # The `python` feature pulls in PyO3 (extension-module), which links
+      # without libpython, so it builds without a Python toolchain here. Build
+      # and lint it so PyO3 API drift is caught as a required check.
+      - name: Build the `python` feature
+        run: cargo build --features python
+
+      - name: Clippy (`python` feature)
+        run: cargo clippy --features python -- -D warnings
 
   msrv:
     name: MSRV (1.86)

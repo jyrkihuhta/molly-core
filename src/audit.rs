@@ -71,9 +71,17 @@ impl AuditLog {
         // Serialize the open+append+write so records are atomic w.r.t. each
         // other across threads.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // The audit log can contain sensitive request metadata — create it
+        // owner-only (0600) on Unix so it isn't world-readable by default.
+        // (Only applies when the file is first created.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
             .open(&path)
             .map_err(|e| AuditError::Io(e.to_string()))?;
         file.write_all(line.as_bytes())
@@ -92,7 +100,7 @@ impl AuditLog {
             timestamp: Utc::now().to_rfc3339(),
             target: target.to_string(),
             method: method.to_string(),
-            url: url.to_string(),
+            url: redact_url_query(url),
             body_hash: body.map(hash_sha256),
             response_status: None,
             elapsed_ms: None,
@@ -113,7 +121,7 @@ impl AuditLog {
             timestamp: Utc::now().to_rfc3339(),
             target: target.to_string(),
             method: method.to_string(),
-            url: url.to_string(),
+            url: redact_url_query(url),
             body_hash: body.map(hash_sha256),
             response_status: Some(status),
             elapsed_ms: Some(elapsed_ms),
@@ -134,7 +142,7 @@ impl AuditLog {
             timestamp: Utc::now().to_rfc3339(),
             target: target.to_string(),
             method: method.to_string(),
-            url: url.to_string(),
+            url: redact_url_query(url),
             body_hash: body.map(hash_sha256),
             response_status: None,
             elapsed_ms,
@@ -190,6 +198,21 @@ fn hash_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Strip and hash a URL's query string before it is recorded. Query parameters
+/// routinely carry secrets (tokens, API keys, session ids); the audit log is a
+/// persistent on-disk record, so the query is replaced by its SHA-256 (the path
+/// is kept for readability), mirroring how bodies and headers are hashed rather
+/// than stored in cleartext. Requests that differ only in query still correlate
+/// by hash.
+fn redact_url_query(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, query)) if !query.is_empty() => {
+            format!("{base}?sha256={}", hash_sha256(query))
+        }
+        _ => url.to_string(),
+    }
 }
 
 /// True for a literal `YYYY-MM-DD` date: exactly 10 chars, digits with `-` at
@@ -437,6 +460,40 @@ mod tests {
         let mut e = AuditLog::post_request_entry("t", "GET", "https://example.com", None, 200, 1);
         e.timestamp = "é".to_string(); // multi-byte and shorter than 10 bytes
         assert!(log.log(&e).is_ok());
+    }
+
+    #[test]
+    fn query_string_is_hashed_not_logged_in_cleartext() {
+        // Secrets in the query string must never land in the log verbatim.
+        let e = AuditLog::pre_request_entry(
+            "t",
+            "GET",
+            "https://example.com/api?token=secret123&k=v",
+            None,
+        );
+        assert!(
+            !e.url.contains("secret123"),
+            "query secret leaked: {}",
+            e.url
+        );
+        assert!(e.url.starts_with("https://example.com/api?sha256="));
+        // A URL without a query is unchanged.
+        let e2 = AuditLog::pre_request_entry("t", "GET", "https://example.com/api", None);
+        assert_eq!(e2.url, "https://example.com/api");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(dir.path().to_path_buf()).unwrap();
+        let e = AuditLog::post_request_entry("t", "GET", "https://example.com", None, 200, 1);
+        log.log(&e).unwrap();
+        let date = &e.timestamp[..10];
+        let path = dir.path().join(format!("{date}.jsonl"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "audit file should be 0600, got {mode:o}");
     }
 
     #[test]

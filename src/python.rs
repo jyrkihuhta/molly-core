@@ -5,6 +5,11 @@
 //! `crate::fetch::HttpClient`, …); the safety gates live in the core and cannot
 //! be bypassed from Python or an LLM.
 
+// The `#[pymethods]` bindings deliberately mirror the many-argument Rust request
+// API and return PyO3-shaped tuple types; refactoring either would change the
+// Python surface. These lints are expected here and allowed module-wide.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use crate::{armed, diff, fetch, scope, scope_lock};
 use pyo3::prelude::*;
 use std::collections::HashMap;

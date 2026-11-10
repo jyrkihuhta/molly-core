@@ -198,12 +198,21 @@ pub fn raw_exchange(
 /// Split a raw HTTP response into (status, headers, body). Lenient — a malformed head
 /// still yields the body after the first blank line so a CGI flag echo isn't lost.
 fn parse_response(raw: &[u8]) -> Result<RawResponse, String> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "raw response has no header terminator".to_string())?;
+    // Header terminator: CRLFCRLF for a conforming server, but tolerate an
+    // LF-only `\n\n` as well so a non-conforming server's body (a CGI flag echo,
+    // say) isn't lost — matching this module's documented leniency. Use whichever
+    // terminator appears first.
+    let crlf = raw.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = raw.windows(2).position(|w| w == b"\n\n");
+    let (split, sep_len) = match (crlf, lf) {
+        (Some(c), Some(l)) if c <= l => (c, 4),
+        (Some(_), Some(l)) => (l, 2),
+        (Some(c), None) => (c, 4),
+        (None, Some(l)) => (l, 2),
+        (None, None) => return Err("raw response has no header terminator".to_string()),
+    };
     let head = String::from_utf8_lossy(&raw[..split]);
-    let body = String::from_utf8_lossy(&raw[split + 4..]).to_string();
+    let body = String::from_utf8_lossy(&raw[split + sep_len..]).to_string();
 
     let mut lines = head.lines();
     let status_line = lines.next().unwrap_or("");
@@ -308,6 +317,17 @@ mod tests {
         assert_eq!(r.status, 404);
         assert_eq!(r.body, "<h1>nope</h1>");
         assert_eq!(r.headers.get("content-type").unwrap(), "text/html");
+    }
+
+    #[test]
+    fn parse_response_tolerates_lf_only_terminator() {
+        // A non-conforming server using bare LF line endings must not cost us
+        // the body.
+        let raw = b"HTTP/1.1 200 OK\nContent-Type: text/plain\n\nflag-body";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, "flag-body");
+        assert_eq!(r.headers.get("content-type").unwrap(), "text/plain");
     }
 
     #[test]
